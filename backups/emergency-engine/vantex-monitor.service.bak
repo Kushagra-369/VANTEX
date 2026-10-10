@@ -1,0 +1,14 @@
+
+[Unit]
+Description=VANTEX Background PC Monitor
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Desktop/VANTEX
+ExecStart=%h/Desktop/VANTEX/.venv/bin/python %h/Desktop/VANTEX/ai/monitor.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

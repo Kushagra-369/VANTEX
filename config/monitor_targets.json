@@ -1,0 +1,32 @@
+
+{
+  "settings": {
+    "check_interval_seconds": 15,
+    "failure_threshold": 2,
+    "recovery_threshold": 1,
+    "alert_cooldown_seconds": 300,
+    "request_timeout_seconds": 8
+  },
+  "websites": [
+    {
+      "name": "VANTEX Local Web",
+      "url": "http://127.0.0.1:5173",
+      "enabled": true,
+      "expected_status": [200]
+    },
+    {
+      "name": "VANTEX Local API",
+      "url": "http://127.0.0.1:8000/health",
+      "enabled": true,
+      "expected_status": [200]
+    }
+  ],
+  "applications": [
+  {
+    "name": "VANTEX API",
+    "process_name": "python",
+    "cmdline_contains": "uvicorn ai.main:app",
+    "enabled": true
+  }
+]
+}

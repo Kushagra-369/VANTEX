@@ -1,0 +1,93 @@
+
+import logging
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import psutil
+
+INTERVAL = 5
+CPU_LIMIT = 90
+RAM_LIMIT = 90
+DISK_LIMIT = 90
+ALERT_COOLDOWN = 600
+
+STATE_DIR = Path.home() / ".local" / "state" / "vantex"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    filename=STATE_DIR / "monitor.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+last_alert = {}
+active_issues = set()
+
+
+def notify(title: str, message: str) -> None:
+    logging.warning("%s: %s", title, message)
+
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(
+                ["notify-send", "--urgency=critical", title, message],
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logging.exception("Desktop notification failed")
+
+
+def check_metric(name: str, value: float, limit: float) -> None:
+    now = time.monotonic()
+    issue = f"{name}_high"
+
+    if value >= limit:
+        if issue not in active_issues:
+            active_issues.add(issue)
+            logging.warning("%s reached %.1f%%", name, value)
+
+        if now - last_alert.get(issue, -float("inf")) >= ALERT_COOLDOWN:
+            notify(
+                f"VANTEX Alert: {name}",
+                f"{name} usage is {value:.1f}% (threshold: {limit:.0f}%).",
+            )
+            last_alert[issue] = now
+    elif issue in active_issues:
+        active_issues.remove(issue)
+        logging.info("%s returned below threshold: %.1f%%", name, value)
+        notify("VANTEX: System recovered", f"{name} usage is now {value:.1f}%.")
+
+
+def monitor() -> None:
+    logging.info("VANTEX background monitor started")
+
+    while True:
+        try:
+            cpu = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage("/")
+
+            check_metric("CPU", cpu, CPU_LIMIT)
+            check_metric("RAM", memory.percent, RAM_LIMIT)
+            check_metric("Disk", disk.percent, DISK_LIMIT)
+
+            logging.info(
+                "CPU=%.1f%% RAM=%.1f%% DISK=%.1f%%",
+                cpu,
+                memory.percent,
+                disk.percent,
+            )
+        except Exception:
+            logging.exception("Monitoring cycle failed")
+
+        time.sleep(max(0, INTERVAL - 1))
+
+
+if __name__ == "__main__":
+    try:
+        monitor()
+    except KeyboardInterrupt:
+        logging.info("VANTEX background monitor stopped")
