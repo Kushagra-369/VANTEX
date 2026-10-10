@@ -112,3 +112,138 @@ button:focus-visible {
     font-size: 36px;
   }
 }
+
+
+.monitor-section {
+  margin-top: 32px;
+}
+
+.monitor-section-heading {
+  margin-bottom: 14px;
+}
+
+.monitor-section-heading h2 {
+  margin: 8px 0 0;
+  color: #eaf7ff;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.monitor-list {
+  overflow: hidden;
+  border: 1px solid rgba(58, 150, 202, 0.22);
+  border-radius: 12px;
+  background: rgba(5, 18, 32, 0.72);
+}
+
+.monitor-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid rgba(58, 150, 202, 0.13);
+}
+
+.monitor-row:last-child {
+  border-bottom: 0;
+}
+
+.monitor-row-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.monitor-row-main > div {
+  min-width: 0;
+}
+
+.monitor-row h3 {
+  margin: 0;
+  color: #eaf7ff;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.monitor-row p {
+  margin: 5px 0 0;
+  color: #829db2;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.monitor-status {
+  flex-shrink: 0;
+  padding: 5px 9px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.monitor-status.online {
+  color: #39e6a2;
+}
+
+.monitor-status.offline {
+  color: #ff7777;
+}
+
+@media (max-width: 520px) {
+  .monitor-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .monitor-status {
+    margin-left: 24px;
+  }
+}
+
+.pc-intel-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 24px 0 30px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(58, 150, 202, 0.2);
+}
+
+.pc-intel-tab {
+  padding: 10px 15px;
+  border: 1px solid rgba(58, 150, 202, 0.22);
+  border-radius: 8px;
+  color: #91aec2;
+  background: rgba(5, 18, 32, 0.72);
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+
+.pc-intel-tab:hover,
+.pc-intel-tab.active {
+  color: #eaf7ff;
+  border-color: rgba(66, 210, 255, 0.6);
+  background: rgba(12, 75, 108, 0.3);
+}
+
+.intel-block {
+  margin-bottom: 32px;
+}
+
+.monitor-status.checking {
+  color: #f5c76b;
+}
+
+@media (max-width: 520px) {
+  .pc-intel-nav {
+    gap: 6px;
+  }
+
+  .pc-intel-tab {
+    padding: 9px 11px;
+    font-size: 12px;
+  }
+}

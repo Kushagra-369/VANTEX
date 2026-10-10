@@ -496,6 +496,109 @@ async def run_agent_command(request: AgentCommandRequest):
     command = request.command.strip()
     lowered = command.casefold()
 
+    # Natural-language PC file commands
+    open_words = ("open", "open file", "kholo", "khol", "khul")
+
+    # Latest screenshot: show its location or open it.
+    if (
+        ("screenshot" in lowered or "screen shot" in lowered or " ss " in f" {lowered} ")
+        and any(word in lowered for word in ("latest", "last", "newest", "recent", "sabse nayi", "latest wali"))
+    ):
+        screenshot = latest_pc_screenshot()
+
+        if any(word in lowered for word in ("open", "kholo", "khol", "khul")):
+            opened = open_pc_file(OpenPcFileRequest(path=screenshot["path"]))
+            return {
+                "command": command,
+                "action": "open_latest_screenshot",
+                "result": opened,
+            }
+
+        return {
+            "command": command,
+            "action": "latest_screenshot",
+            "result": screenshot,
+        }
+
+    # Hindi/English request to list files matching a phrase.
+    hindi_search = re.fullmatch(
+        r"(.+?)\s+(?:wali|waali)\s+(?:(?:saari|sari)\s+)?files?\s+(?:de|dikha|dikhao|bata|batao|show)",
+        lowered,
+    )
+
+    english_search = re.fullmatch(
+        r"(?:find|search|show|list)\s+(?:all\s+)?(?:pc\s+)?files?\s+(?:named|matching|for|about)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if hindi_search or english_search:
+        query = (
+            hindi_search.group(1).strip()
+            if hindi_search
+            else english_search.group(1).strip()
+        )
+        result = search_pc_files(query)
+        return {
+            "command": command,
+            "action": "search_pc_files",
+            "result": result,
+        }
+
+    # Open a named file only if there is one unambiguous match.
+    open_match = re.fullmatch(
+        r"(?:open(?:\s+file)?|kholo|khol|khul)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if open_match:
+        target = open_match.group(1).strip()
+
+        if target.casefold() in {
+            "latest screenshot", "latest ss", "last screenshot",
+            "last ss", "newest screenshot",
+        }:
+            screenshot = latest_pc_screenshot()
+            opened = open_pc_file(OpenPcFileRequest(path=screenshot["path"]))
+            return {
+                "command": command,
+                "action": "open_latest_screenshot",
+                "result": opened,
+            }
+
+        result = search_pc_files(target)
+        matches = result["matches"]
+
+        exact = [
+            item for item in matches
+            if item["name"].casefold() == target.casefold()
+        ]
+
+        if len(exact) == 1:
+            selected = exact[0]
+        elif len(matches) == 1:
+            selected = matches[0]
+        else:
+            return {
+                "command": command,
+                "action": "select_file",
+                "selection_required": True,
+                "message": (
+                    "No matching file found."
+                    if not matches
+                    else "Multiple files match. Choose the exact file path."
+                ),
+                "result": result,
+            }
+
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_pc_file",
+            "result": opened,
+        }
+
     # 1. System status
     if lowered in {"system status", "pc status", "check system"}:
         return {
@@ -567,3 +670,224 @@ async def run_agent_command(request: AgentCommandRequest):
             "or test website http://localhost:5173"
         ),
     )
+
+
+from fastapi import HTTPException
+
+MONITOR_STATUS_PATH = (
+    Path.home() / ".local" / "state" / "vantex" / "status.json"
+)
+
+
+@app.get("/api/agent/monitor/status")
+def get_monitor_status():
+    if not MONITOR_STATUS_PATH.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="VANTEX monitor status is not available yet.",
+        )
+
+    try:
+        import json
+
+        with MONITOR_STATUS_PATH.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read VANTEX monitor status.",
+        )
+
+
+# VANTEX File Operator — separate read/search/open permissions
+import subprocess
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+PC_FILE_ROOTS = [
+    (Path.home() / name).resolve()
+    for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos")
+    if (Path.home() / name).is_dir()
+]
+
+PC_SKIP_DIRS = {"venv", "env", ".tox", 
+    ".git", ".venv", "node_modules", "__pycache__",
+    "dist", "build", ".cache", ".local"
+}
+
+PC_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+PC_SCAN_LIMIT = 20000
+
+
+def resolve_pc_file(raw_path: str) -> Path:
+    """Resolve a file only inside approved personal folders."""
+    candidate = Path(raw_path).expanduser()
+
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file():
+            raise ValueError("Not a regular file")
+
+        if not any(
+            resolved.is_relative_to(root)
+            for root in PC_FILE_ROOTS
+        ):
+            raise ValueError("Outside approved folders")
+
+        return resolved
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(
+            status_code=403,
+            detail="File is missing or outside VANTEX approved folders."
+        )
+
+
+def scan_pc_files():
+    # Give every approved root its own scan budget so a large
+    # Desktop tree cannot prevent Pictures from being scanned.
+    for root in PC_FILE_ROOTS:
+        scanned = 0
+
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [
+                name for name in dirs
+                if name not in PC_SKIP_DIRS
+                and not name.startswith(".")
+                and not (Path(current) / name).is_symlink()
+            ]
+
+            for name in files:
+                candidate = Path(current) / name
+
+                if name.startswith(".") or candidate.is_symlink():
+                    continue
+
+                scanned += 1
+                if scanned > PC_SCAN_LIMIT:
+                    dirs[:] = []
+                    break
+
+                try:
+                    resolved = candidate.resolve(strict=True)
+
+                    if not any(
+                        resolved.is_relative_to(approved_root)
+                        for approved_root in PC_FILE_ROOTS
+                    ):
+                        continue
+
+                    stat = resolved.stat()
+                    if not resolved.is_file():
+                        continue
+
+                    yield {
+                        "name": resolved.name,
+                        "path": str(resolved),
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            stat.st_mtime
+                        ).astimezone().isoformat(),
+                        "_mtime": stat.st_mtime,
+                    }
+                except (OSError, ValueError, RuntimeError):
+                    continue
+
+
+@app.get("/api/agent/pc-files/search")
+def search_pc_files(
+    query: str = Query(min_length=1, max_length=200),
+):
+    needle = query.strip().casefold()
+    if not needle:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    query_tokens = re.findall(r"[a-z0-9]+", needle)
+    matches = []
+    scanned = 0
+
+    for item in scan_pc_files():
+        scanned += 1
+        filename = item["name"].casefold()
+        filename_tokens = re.findall(r"[a-z0-9]+", filename)
+
+        if (
+            needle in filename
+            or (
+                query_tokens
+                and all(token in filename_tokens for token in query_tokens)
+            )
+        ):
+            item.pop("_mtime", None)
+            matches.append(item)
+
+            if len(matches) >= 100:
+                break
+
+    return {
+        "query": query,
+        "roots": [str(root) for root in PC_FILE_ROOTS],
+        "matches": matches,
+        "count": len(matches),
+        "scan_limit": PC_SCAN_LIMIT,
+    }
+
+
+@app.get("/api/agent/pc-files/latest-screenshot")
+def latest_pc_screenshot():
+    screenshots = []
+
+    for item in scan_pc_files():
+        name = item["name"].casefold()
+        path = item["path"].casefold()
+
+        is_screenshot = (
+            item["name"].lower().endswith(tuple(PC_IMAGE_EXTENSIONS))
+            and (
+                "screenshot" in name
+                or "screen shot" in name
+                or "screenshots" in path
+            )
+        )
+
+        if is_screenshot:
+            screenshots.append(item)
+
+    if not screenshots:
+        raise HTTPException(
+            status_code=404,
+            detail="No screenshots found in approved folders."
+        )
+
+    latest = max(screenshots, key=lambda item: item["_mtime"])
+    latest.pop("_mtime", None)
+    return latest
+
+
+class OpenPcFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/api/agent/pc-files/open")
+def open_pc_file(request: OpenPcFileRequest):
+    file_path = resolve_pc_file(request.path)
+
+    try:
+        subprocess.Popen(
+            ["xdg-open", str(file_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not launch the default application: {error}"
+        ) from error
+
+    return {
+        "opened": True,
+        "name": file_path.name,
+        "path": str(file_path),
+        "message": "Open request sent to the default desktop application."
+    }
