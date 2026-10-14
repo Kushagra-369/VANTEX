@@ -520,7 +520,38 @@ async def run_agent_command(request: AgentCommandRequest):
             "result": screenshot,
         }
 
-    # Hindi/English request to list files matching a phrase.
+    # Hindi/English file search, optionally restricted to one approved folder.
+    folder_names = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+
+    detected_folder = next(
+        (value for key, value in folder_names.items()
+         if re.search(rf"\b{key}\b", lowered)),
+        None,
+    )
+
+    folder_search = re.search(
+        r"(.+?)\s+(?:mein|me|par|pe)\s+(.+?)\s+(?:wali|waali)\s+files?\s+(?:de|dikha|dikhao|bata|batao|show)",
+        lowered,
+    )
+
+    if folder_search:
+        folder_from_command = folder_names.get(folder_search.group(1).strip())
+        if folder_from_command:
+            detected_folder = folder_from_command
+            query = folder_search.group(2).strip()
+            result = search_pc_files(query, folder=detected_folder)
+            return {
+                "command": command,
+                "action": "search_pc_files",
+                "result": result,
+            }
+
     hindi_search = re.fullmatch(
         r"(.+?)\s+(?:wali|waali)\s+(?:(?:saari|sari)\s+)?files?\s+(?:de|dikha|dikhao|bata|batao|show)",
         lowered,
@@ -538,12 +569,456 @@ async def run_agent_command(request: AgentCommandRequest):
             if hindi_search
             else english_search.group(1).strip()
         )
-        result = search_pc_files(query)
+        result = search_pc_files(query, folder=detected_folder)
         return {
             "command": command,
             "action": "search_pc_files",
             "result": result,
         }
+
+
+
+
+    # General PC content search: documents, source code and configuration files.
+    content_extensions = {
+        ".pdf", ".docx", ".txt", ".md", ".rst", ".csv", ".log",
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".yaml",
+        ".yml", ".html", ".css", ".xml", ".sql", ".sh", ".toml",
+        ".ini", ".cfg", ".conf",
+    }
+
+   
+    ranking_occurrences = any(term in lowered for term in (
+        "sabse zyada baar", "sabse jyada baar",
+        "most occurrences", "most times", "appears most",
+        "mentioned most", "highest occurrence count",
+    ))
+
+    ranking_most = ranking_occurrences or any(term in lowered for term in (
+        "sabse zyada content", "most content", "maximum content",
+        "longest resume", "sabse detailed", "most words",
+        "most text", "longest document",
+    ))
+
+    ranking_least = any(term in lowered for term in (
+        "sabse kam content", "least content", "least words",
+        "shortest resume", "minimum content", "kam content",
+        "least text", "shortest document",
+    ))
+
+    ranking_largest = any(term in lowered for term in (
+        "sabse badi file", "largest file", "biggest file",
+        "sabse badi pdf", "largest pdf",
+    ))
+
+        # Generic content search: search terms are taken from the user's command.
+    content_search_patterns = [
+        re.compile(
+            r"^\s*(?:please\s+)?(?:search|find|look\s+for)\s+"
+            r"(?:all\s+)?files?\s+"
+            r"(?:with|containing|that\s+contain|mentioning)\s+(.+?)\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:please\s+)?(?:search|find|look\s+for)\s+"
+            r"(.+?)\s+files?\s+for\s+(.+?)\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:please\s+)?(?:search|find|look\s+for)\s+"
+            r"(resume|cv)\s+for\s+(.+?)\s*$",
+            re.IGNORECASE,
+        ),
+    ]
+
+    content_intent = (
+        ranking_most or ranking_least or ranking_largest
+    )
+    query = None
+    category_filter = None
+
+    for pattern in content_search_patterns:
+        match = pattern.match(command)
+        if not match:
+            continue
+
+        content_intent = True
+
+        if len(match.groups()) == 2:
+            category_filter = match.group(1).strip()
+            query = match.group(2).strip()
+        else:
+            query = match.group(1).strip()
+
+        break
+
+    # Also support commands such as:
+    # "Find text Auralink inside files"
+    if not content_intent:
+        match = re.search(
+            r"\b(?:find\s+text|search\s+content|search\s+inside|"
+            r"search\s+within|file\s+containing|document\s+containing)"
+            r"\s+(.+?)(?:\s+inside\s+files?)?\s*$",
+            command,
+            re.IGNORECASE,
+        )
+        if match:
+            content_intent = True
+            query = match.group(1).strip()
+
+    if query:
+        query = re.sub(r"\s+", " ", query).strip(" .,!?:;")
+
+    if not query and not (
+        ranking_most or ranking_least or ranking_largest
+    ):
+        content_intent = False
+
+    if content_intent:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from pypdf import PdfReader
+
+        extension_filter = None
+
+        wants_open = bool(re.search(
+            r"\b(open|kholo|khol|khul)\b", lowered
+        ))
+ 
+
+    if content_intent:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from pypdf import PdfReader
+
+        extension_filter = None
+        for ext, aliases in {
+            ".pdf": ("pdf",),
+            ".docx": ("docx", "word document"),
+            ".txt": ("txt", "text file"),
+            ".md": ("markdown", ".md"),
+            ".py": ("python file", ".py"),
+            ".tsx": ("tsx",),
+            ".ts": ("typescript file",),
+            ".js": ("javascript file",),
+            ".csv": ("csv",),
+        }.items():
+            if any(alias in lowered for alias in aliases):
+                extension_filter = ext
+                break
+
+        wants_open = bool(re.search(
+            r"\b(open|kholo|khol|khul)\b", lowered
+        ))
+
+        
+       
+        # Generic parsing: separate file category from the text to search.
+        query = None
+        category_filter = None
+
+        command_text = command.strip()
+
+        # Example: Search resume with Shruti
+        match = re.match(
+            r"^(?:please\s+)?(?:search|find|look for)\s+"
+            r"(?:the\s+)?(resume|resumes|cv|cvs)\s+"
+            r"(?:for|with|containing|mentioning)\s+(.+?)\s*$",
+            command_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            category_filter = "resume"
+            query = match.group(2).strip()
+
+        # Example: Search operating system file with experiment 2
+        if query is None:
+            match = re.match(
+                r"^(?:please\s+)?(?:search|find|look for)\s+"
+                r"(.+?)\s+files?\s+(?:for|with|containing|mentioning)\s+"
+                r"(.+?)\s*$",
+                command_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                category_filter = match.group(1).strip()
+                query = match.group(2).strip()
+
+        # Example: Search files with Auralink
+        if query is None:
+            match = re.match(
+                r"^(?:please\s+)?(?:search|find|look for)\s+"
+                r"(?:all\s+)?files?\s+"
+                r"(?:with|containing|that\s+contain|mentioning)\s+"
+                r"(.+?)\s*$",
+                command_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                query = match.group(1).strip()
+
+        # Other explicit content-search forms
+        if query is None:
+            match = re.match(
+                r"^(?:please\s+)?(?:find text|search content|"
+                r"search inside|search within)\s+(.+?)"
+                r"(?:\s+inside files?)?\s*$",
+                command_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                query = match.group(1).strip()
+
+        if query:
+            query = re.sub(r"\s+", " ", query).strip(" .,!?:;")
+
+        if not query and not (
+            ranking_most or ranking_least or ranking_largest
+        ):
+            content_intent = False
+
+
+
+    if content_intent:
+        def extract_searchable_text(path):
+            suffix = path.suffix.casefold()
+            if suffix == ".pdf":
+                reader = PdfReader(str(path))
+                return "\n".join(page.extract_text() or "" for page in reader.pages)
+            if suffix == ".docx":
+                with zipfile.ZipFile(path) as archive:
+                    xml_data = archive.read("word/document.xml")
+                root = ET.fromstring(xml_data)
+                return " ".join(
+                    element.text or ""
+                    for element in root.iter()
+                    if element.tag.endswith("}t")
+                )
+            # Avoid reading very large source/log files into memory.
+            if path.stat().st_size > 5 * 1024 * 1024:
+                return ""
+            return path.read_text(encoding="utf-8", errors="ignore")
+
+        candidates = []
+        scanned = 0
+       
+
+        for item in scan_pc_files():
+            path = Path(item["path"])
+            suffix = path.suffix.casefold()
+
+            if suffix not in content_extensions:
+                continue
+            if extension_filter and suffix != extension_filter:
+                continue
+
+            if category_filter:
+                category_tokens = re.findall(
+                    r"[a-z0-9]+", category_filter.casefold()
+                )
+                filename_tokens = re.findall(
+                    r"[a-z0-9]+", path.stem.casefold()
+                )
+
+                if not all(
+                    token in filename_tokens
+                    for token in category_tokens
+                ):
+                    continue
+
+         
+
+            scanned += 1
+            if scanned > 2000:
+                break
+
+            try:
+                safe_path = resolve_pc_file(str(path))
+                extracted = extract_searchable_text(safe_path)
+                normalized = re.sub(r"[^a-z0-9]+", "", extracted.casefold())
+
+                # Ignore empty/unreadable content so it cannot win "least content".
+                if not extracted.strip():
+                    continue
+
+                
+                if query:
+                    normalized_query = re.sub(
+                        r"[^a-z0-9]+", "", query.casefold()
+                    )
+                    if not normalized_query or normalized_query not in normalized:
+                        continue
+                    occurrences = normalized.count(normalized_query)
+                else:
+                    occurrences = 0
+
+                candidates.append({
+                    "name": path.name,
+                    "path": str(safe_path),
+                    "extension": path.suffix.casefold(),
+                    "size_bytes": safe_path.stat().st_size,
+                    "words": len(extracted.split()),
+                    "characters": len(extracted),
+                    "occurrences": occurrences,
+                    "preview": " ".join(extracted.split())[:240],
+                })
+
+            except Exception:
+                continue
+
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No supported file matched the content query: {query}"
+                    if query else "No readable files matched the requested criteria."
+                ),
+            )
+
+        
+        if ranking_occurrences:
+            candidates.sort(
+                key=lambda item: item["occurrences"],
+                reverse=True,
+            )
+        elif ranking_most:
+            candidates.sort(key=lambda item: item["words"], reverse=True)
+        elif ranking_least:
+            candidates.sort(key=lambda item: item["words"])
+        elif ranking_largest:
+            candidates.sort(key=lambda item: item["size_bytes"], reverse=True)
+        else:
+            candidates.sort(key=lambda item: item["words"], reverse=True)
+
+
+        if not wants_open:
+            return {
+                "command": command,
+                "action": "search_file_content",
+                "query": query,
+                "count": len(candidates),
+                "scanned_files": scanned,
+                "results": candidates[:50],
+                "read_only": True,
+            }
+
+        if len(candidates) > 1 and not (ranking_most or ranking_least or ranking_largest):
+            return {
+                "command": command,
+                "action": "select_file",
+                "selection_required": True,
+                "message": "Multiple files match. Review the results before opening one.",
+                "query": query,
+                "results": candidates[:20],
+                "read_only": True,
+            }
+
+        selected = candidates[0]
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_file_by_content",
+            "query": query,
+            "selection": selected,
+            "scanned_files": scanned,
+            "read_only_search": True,
+            "result": opened,
+        }
+
+    # Open the latest matching file by modification date.
+    latest_resume_request = (
+        "resume" in lowered
+        and any(word in lowered for word in (
+            "latest", "last", "newest", "recent",
+            "sabse nayi", "sabse latest"
+        ))
+        and any(word in lowered for word in (
+            "open", "kholo", "khol", "khul"
+        ))
+    )
+
+    if latest_resume_request:
+        result = search_pc_files(query="resume", folder=None)
+        matches = [
+            item for item in result["matches"]
+            if Path(item["name"]).suffix.casefold() in {
+                ".pdf", ".doc", ".docx", ".odt"
+            }
+        ]
+
+        if not matches:
+            raise HTTPException(
+                status_code=404,
+                detail="No resume documents found in approved folders."
+            )
+
+        selected = max(
+            matches,
+            key=lambda item: item.get("modified_at", "")
+        )
+
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_latest_resume",
+            "result": opened,
+        }
+
+    # Open a named file, optionally restricted to an approved folder.
+    folder_open_match = re.fullmatch(
+        r"(.+?)\s+(?:mein|me|par|pe)\s+(.+?)\s+(?:open|kholo|khol|khul)(?:\s+kar)?",
+        lowered,
+    )
+
+    if folder_open_match:
+        folder_label = folder_open_match.group(1).strip()
+        target = folder_open_match.group(2).strip()
+
+        folder_aliases = {
+            "desktop": "Desktop",
+            "downloads": "Downloads",
+            "documents": "Documents",
+            "pictures": "Pictures",
+            "videos": "Videos",
+        }
+        selected_folder = folder_aliases.get(folder_label)
+
+        if selected_folder:
+            result = search_pc_files(target, folder=selected_folder)
+            matches = result["matches"]
+
+            exact = [
+                item for item in matches
+                if item["name"].casefold() == target.casefold()
+            ]
+
+            if len(exact) == 1:
+                selected = exact[0]
+            elif len(matches) == 1:
+                selected = matches[0]
+            else:
+                return {
+                    "command": command,
+                    "action": "select_file",
+                    "selection_required": True,
+                    "message": (
+                        "No matching file found."
+                        if not matches
+                        else "Multiple files match. Choose the exact file path."
+                    ),
+                    "result": result,
+                }
+
+            opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+            return {
+                "command": command,
+                "action": "open_pc_file",
+                "result": opened,
+            }
 
     # Open a named file only if there is one unambiguous match.
     open_match = re.fullmatch(
@@ -614,6 +1089,45 @@ async def run_agent_command(request: AgentCommandRequest):
             "action": "list_files",
             "result": list_agent_files(),
         }
+
+    # Generic content search: parse category and query from the command.
+    content_match = re.fullmatch(
+        r"(?:please\s+)?(?:search|find|look\s+for)\s+"
+        r"(?:all\s+)?files?\s+"
+        r"(?:with|containing|that\s+contain|mentioning)\s+(.+?)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if content_match:
+        content_query = content_match.group(1).strip()
+        content_command = f"Search files with {content_query}"
+        return await run_agent_command(
+            AgentCommandRequest(command=content_command)
+        )
+
+    content_match = re.fullmatch(
+        r"(?:please\s+)?(?:search|find|look\s+for)\s+"
+        r"(.+?)\s+(?:files?\s+)?"
+        r"(?:for|with|containing|mentioning)\s+(.+?)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if content_match:
+        category = re.sub(
+            r"\s+files?$", "", content_match.group(1).strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        content_query = content_match.group(2).strip()
+
+        if category and content_query:
+            content_command = (
+                f"Search {category} files for {content_query}"
+            )
+            return await run_agent_command(
+                AgentCommandRequest(command=content_command)
+            )
 
     # 3. Search by filename
     match = re.fullmatch(
@@ -793,9 +1307,174 @@ def scan_pc_files():
                     continue
 
 
+def calculate_file_sha256(file_path: str) -> str:
+    """Read a file in chunks and return its SHA-256 hash."""
+    digest = hashlib.sha256()
+
+    with open(file_path, "rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+@app.get("/api/agent/pc-files/duplicates")
+def find_pc_file_duplicates(
+    min_size_bytes: int = Query(default=1, ge=1),
+):
+    """
+    Read-only duplicate scan.
+    Files are considered duplicates only when size and SHA-256 match.
+    No files are moved, edited, or deleted.
+    """
+    candidates_by_size = {}
+
+    for item in scan_pc_files():
+        size = item["size_bytes"]
+
+        if size < min_size_bytes:
+            continue
+
+        candidates_by_size.setdefault(size, []).append(item)
+
+    duplicate_groups = []
+    files_hashed = 0
+    bytes_hashed = 0
+
+    for size, items in candidates_by_size.items():
+        if len(items) < 2:
+            continue
+
+        candidates_by_hash = {}
+
+        for item in items:
+            try:
+                current_path = resolve_pc_file(item["path"])
+
+                # Avoid hashing a file that changed after the scan.
+                if current_path.stat().st_size != size:
+                    continue
+
+                file_hash = calculate_file_sha256(str(current_path))
+                files_hashed += 1
+                bytes_hashed += size
+
+                candidates_by_hash.setdefault(file_hash, []).append(item)
+
+            except (OSError, ValueError, RuntimeError, HTTPException):
+                continue
+
+        for file_hash, group in candidates_by_hash.items():
+            if len(group) < 2:
+                continue
+
+            for item in group:
+                item.pop("_mtime", None)
+
+            duplicate_groups.append({
+                "sha256": file_hash,
+                "size_bytes": size,
+                "copies": len(group),
+                "files": sorted(group, key=lambda item: item["path"]),
+            })
+
+    duplicate_groups.sort(
+        key=lambda group: (
+            group["size_bytes"] * (group["copies"] - 1),
+            group["size_bytes"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "read_only": True,
+        "files_hashed": files_hashed,
+        "bytes_hashed": bytes_hashed,
+        "duplicate_groups": duplicate_groups,
+        "duplicate_group_count": len(duplicate_groups),
+        "duplicate_copy_count": sum(
+            group["copies"] for group in duplicate_groups
+        ),
+        "potential_reclaimable_bytes": sum(
+            group["size_bytes"] * (group["copies"] - 1)
+            for group in duplicate_groups
+        ),
+        "note": "No files were modified or deleted.",
+    }
+
+
+
+@app.get("/api/agent/pc-files/search-content")
+def search_pc_pdf_content(
+    query: str = Query(min_length=1, max_length=200),
+    folder: str | None = Query(default=None, max_length=50),
+):
+    """Read-only search inside text-based PDF files in approved PC folders."""
+    from pypdf import PdfReader
+
+    needle = re.sub(r"[^a-z0-9]", "", query.casefold())
+    if not needle:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    allowed = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+    selected_folder = None
+    if folder:
+        selected_folder = allowed.get(folder.strip().casefold())
+        if selected_folder is None:
+            raise HTTPException(status_code=400, detail="Unsupported folder.")
+
+    matches = []
+    scanned = 0
+
+    for item in scan_pc_files():
+        path = Path(item["path"])
+        if path.suffix.casefold() != ".pdf":
+            continue
+
+        if selected_folder and path.parts[len(Path.home().parts)] != selected_folder:
+            continue
+
+        scanned += 1
+        if scanned > 500:
+            break
+
+        try:
+            safe_path = resolve_pc_file(str(path))
+            reader = PdfReader(str(safe_path))
+            extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+            normalized = re.sub(r"[^a-z0-9]", "", extracted.casefold())
+
+            if needle in normalized:
+                matches.append({
+                    "name": path.name,
+                    "path": str(path),
+                    "pages": len(reader.pages),
+                    "characters": len(extracted),
+                    "words": len(extracted.split()),
+                })
+        except Exception:
+            continue
+
+    return {
+        "query": query,
+        "folder": selected_folder,
+        "scanned_pdfs": scanned,
+        "count": len(matches),
+        "matches": matches,
+        "read_only": True,
+    }
+
+
 @app.get("/api/agent/pc-files/search")
 def search_pc_files(
     query: str = Query(min_length=1, max_length=200),
+    folder: str | None = Query(default=None, max_length=50),
 ):
     needle = query.strip().casefold()
     if not needle:
@@ -803,32 +1482,111 @@ def search_pc_files(
 
     query_tokens = re.findall(r"[a-z0-9]+", needle)
     matches = []
-    scanned = 0
+
+        # Recognize natural-language file-type searches.
+    extension_aliases = {
+        "python": {".py"},
+        "javascript": {".js", ".jsx"},
+        "typescript": {".ts", ".tsx"},
+        "css": {".css"},
+        "html": {".html", ".htm"},
+        "json": {".json"},
+        "pdf": {".pdf"},
+        "markdown": {".md"},
+        "text": {".txt"},
+    }
+
+    requested_extensions = None
+    type_match = re.fullmatch(
+        r"(?:all\s+)?(python|javascript|typescript|css|html|json|pdf|markdown|text)"
+        r"(?:\s+(?:source\s+)?files?)?",
+        needle,
+    )
+
+    if type_match:
+        requested_extensions = extension_aliases[type_match.group(1)]
+
+    allowed_folder_names = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+
+    selected_folder = None
+    if folder:
+        selected_folder = allowed_folder_names.get(folder.strip().casefold())
+        if selected_folder is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported folder. Use Desktop, Downloads, Documents, Pictures, or Videos."
+            )
 
     for item in scan_pc_files():
-        scanned += 1
+        if selected_folder and Path(item["path"]).parts[
+            len(Path.home().parts)
+        ] != selected_folder:
+            continue
+
+        if requested_extensions is not None:
+            if Path(item["name"]).suffix.casefold() not in requested_extensions:
+                continue
+
         filename = item["name"].casefold()
         filename_tokens = re.findall(r"[a-z0-9]+", filename)
+        stem = Path(filename).stem
+        stem_tokens = re.findall(r"[a-z0-9]+", stem)
 
-        if (
-            needle in filename
-            or (
-                query_tokens
-                and all(token in filename_tokens for token in query_tokens)
-            )
-        ):
-            item.pop("_mtime", None)
-            matches.append(item)
+        if not query_tokens:
+            continue
 
-            if len(matches) >= 100:
-                break
+        matched_tokens = sum(
+            1 for token in query_tokens
+            if token in filename_tokens
+        )
+
+        if requested_extensions is None:
+            if matched_tokens != len(query_tokens):
+                continue
+
+        if needle in filename:
+            score = 100
+        else:
+            score = 80
+
+        # Prefer matching the main filename over an extension-only match.
+        if all(token in stem_tokens for token in query_tokens):
+            score += 10
+
+        # Small boost for common document types.
+        if Path(filename).suffix in {".pdf", ".doc", ".docx", ".odt"}:
+            score += 2
+
+        item["_score"] = score
+        matches.append(item)
+
+    # Relevance first; newer files break ties.
+    matches.sort(
+        key=lambda item: (item["_score"], item.get("_mtime", 0)),
+        reverse=True,
+    )
+
+    for item in matches:
+        item.pop("_mtime", None)
+        item.pop("_score", None)
 
     return {
         "query": query,
-        "roots": [str(root) for root in PC_FILE_ROOTS],
-        "matches": matches,
-        "count": len(matches),
+        "folder": selected_folder,
+        "roots": (
+            [str(root) for root in PC_FILE_ROOTS
+             if not selected_folder or root.name == selected_folder]
+        ),
+        "matches": matches[:100],
+        "count": min(len(matches), 100),
         "scan_limit": PC_SCAN_LIMIT,
+        "sorted_by": "relevance_then_modified_date",
     }
 
 

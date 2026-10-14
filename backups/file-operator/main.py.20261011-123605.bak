@@ -1,0 +1,1311 @@
+from urllib.parse import urljoin, urlparse
+import psutil
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from pathlib import Path
+from fastapi import Query
+import difflib
+import hashlib
+import secrets
+from datetime import datetime, timezone
+app = FastAPI(
+    title="VANTEX API",
+    description="VANTEX Website QA Engine",
+    version="0.2.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+class WebsiteTestRequest(BaseModel):
+    url: HttpUrl
+
+
+@app.get("/")
+def home():
+    return {
+        "name": "VANTEX",
+        "message": "Backend is running",
+        "version": "0.2.0",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "vantex-api"}
+
+@app.get("/api/agent/system")
+def get_system_status():
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+
+    return {
+        "agent": "VANTEX Local Agent",
+        "connected": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "system": {
+            "cpu_percent": psutil.cpu_percent(interval=0.5),
+            "ram_percent": memory.percent,
+            "ram_total_gb": round(memory.total / (1024 ** 3), 2),
+            "ram_available_gb": round(memory.available / (1024 ** 3), 2),
+            "disk_percent": disk.percent,
+            "disk_free_gb": round(disk.free / (1024 ** 3), 2),
+        },
+    }
+
+@app.post("/api/qa/test")
+async def test_website(request: WebsiteTestRequest):
+    url = str(request.url)
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only HTTP and HTTPS URLs are supported.")
+
+    console_errors = []
+    failed_requests = []
+    page_errors = []
+    broken_links = []
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+
+            page = await browser.new_page()
+            page.set_default_timeout(10000)
+
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+            page.on(
+                "requestfailed",
+                lambda req: failed_requests.append({
+                    "url": req.url,
+                    "error": req.failure,
+                }),
+            )
+
+            try:
+                response = await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=20000,
+                )
+            except PlaywrightTimeoutError:
+                await browser.close()
+                raise HTTPException(
+                    status_code=504,
+                    detail="Website navigation timed out.",
+                )
+
+            title = await page.title()
+            final_url = page.url
+            status_code = response.status if response else None
+
+            links = await page.locator("a[href]").evaluate_all(
+                """elements => elements
+                    .map(a => a.href)
+                    .filter(href => href.startsWith('http://') ||
+                                    href.startsWith('https://'))
+                """
+            )
+
+            unique_links = list(dict.fromkeys(links))[:15]
+
+            for link in unique_links:
+                try:
+                    result = await page.request.get(
+                        link,
+                        timeout=7000,
+                        fail_on_status_code=False,
+                    )
+
+                    if result.status >= 400:
+                        broken_links.append({
+                            "url": link,
+                            "status": result.status,
+                        })
+                except Exception as error:
+                    broken_links.append({
+                        "url": link,
+                        "error": str(error)[:180],
+                    })
+
+            await browser.close()
+
+            return {
+                "success": True,
+                "tested_url": url,
+                "final_url": final_url,
+                "title": title,
+                "http_status": status_code,
+                "console_errors": console_errors[:30],
+                "page_errors": page_errors[:30],
+                "failed_requests": failed_requests[:30],
+                "broken_links": broken_links,
+                "links_checked": len(unique_links),
+                "summary": {
+                    "console_error_count": len(console_errors),
+                    "page_error_count": len(page_errors),
+                    "failed_request_count": len(failed_requests),
+                    "broken_link_count": len(broken_links),
+                },
+                "note": "Detection only. No source files were modified.",
+            }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Website test failed: {str(error)[:250]}",
+        ) from error
+
+# VANTEX Local File Access — initial restricted version
+
+import os
+
+AGENT_ROOT = (Path.home() / "Desktop" / "VANTEX").resolve()
+MAX_READ_BYTES = 1_000_000
+SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", "dist", "build"}
+
+
+def resolve_agent_path(raw_path: str | None = None) -> Path:
+    """Allow access only inside the configured VANTEX project directory."""
+    candidate = Path(raw_path).expanduser() if raw_path else AGENT_ROOT
+
+    if not candidate.is_absolute():
+        candidate = AGENT_ROOT / candidate
+
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(AGENT_ROOT)
+    except (ValueError, OSError, RuntimeError):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path is outside the approved VANTEX folder or does not exist.",
+        )
+
+    return resolved
+
+
+@app.get("/api/agent/files/list")
+def list_agent_files(path: str | None = Query(default=None)):
+    directory = resolve_agent_path(path)
+
+    if not directory.is_dir():
+        raise HTTPException(status_code=400, detail="Path is not a directory.")
+
+    entries = []
+
+    try:
+        for item in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
+            try:
+                resolved_item = item.resolve(strict=True)
+                resolved_item.relative_to(AGENT_ROOT)
+                is_dir = resolved_item.is_dir()
+
+                entries.append({
+                    "name": item.name,
+                    "type": "directory" if is_dir else "file",
+                    "path": str(resolved_item),
+                    "size_bytes": None if is_dir else resolved_item.stat().st_size,
+                })
+            except (OSError, ValueError, RuntimeError):
+                continue
+
+            if len(entries) >= 200:
+                break
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Permission denied.")
+
+    return {
+        "root": str(AGENT_ROOT),
+        "directory": str(directory),
+        "entries": entries,
+        "count": len(entries),
+    }
+
+
+@app.get("/api/agent/files/search")
+def search_agent_files(
+    query: str = Query(min_length=1, max_length=200),
+):
+    needle = query.casefold()
+    matches = []
+    scanned = 0
+    scan_limit = 10000
+
+    for current, dirs, files in os.walk(AGENT_ROOT, followlinks=False):
+        dirs[:] = [
+            name for name in dirs
+            if name not in SKIP_DIRS
+            and not (Path(current) / name).is_symlink()
+        ]
+
+        for name in files:
+            scanned += 1
+
+            if needle in name.casefold():
+                candidate = Path(current) / name
+
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(AGENT_ROOT)
+
+                    matches.append({
+                        "name": name,
+                        "path": str(resolved),
+                    })
+                except (OSError, ValueError, RuntimeError):
+                    continue
+
+                if len(matches) >= 100:
+                    return {
+                        "query": query,
+                        "matches": matches,
+                        "truncated": True,
+                    }
+
+            if scanned >= scan_limit:
+                return {
+                    "query": query,
+                    "matches": matches,
+                    "truncated": True,
+                    "message": "Scan limit reached.",
+                }
+
+    return {
+        "query": query,
+        "matches": matches,
+        "truncated": False,
+    }
+
+
+@app.get("/api/agent/files/read")
+def read_agent_file(path: str = Query(min_length=1)):
+    file_path = resolve_agent_path(path)
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=400, detail="Path is not a file.")
+
+    if file_path.stat().st_size > MAX_READ_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds the 1 MB read limit.",
+        )
+
+    try:
+        content = file_path.read_bytes()
+
+        if b"\x00" in content:
+            raise HTTPException(
+                status_code=415,
+                detail="Binary files are not supported by this text reader.",
+            )
+
+        text_content = content.decode("utf-8")
+
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=415,
+            detail="File is not valid UTF-8 text.",
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Permission denied.")
+
+    return {
+        "path": str(file_path),
+        "size_bytes": len(content),
+        "content": text_content,
+        "read_only": True,
+    }
+
+# VANTEX controlled file editing
+
+from pydantic import Field
+
+
+class PrepareEditRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    new_content: str = Field(max_length=1_000_000)
+
+
+class ApplyEditRequest(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=100)
+    approve: bool = False
+
+
+# Prototype storage: pending proposals remain in memory until API restarts.
+PENDING_EDITS = {}
+
+
+@app.post("/api/agent/files/prepare-edit")
+def prepare_file_edit(request: PrepareEditRequest):
+    target = resolve_agent_path(request.path)
+
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Target must be an existing file.")
+
+    if target.is_symlink():
+        raise HTTPException(status_code=403, detail="Symbolic links cannot be edited.")
+
+    if target.stat().st_size > MAX_READ_BYTES:
+        raise HTTPException(status_code=413, detail="Original file exceeds 1 MB.")
+
+    try:
+        original_content = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, PermissionError):
+        raise HTTPException(
+            status_code=415,
+            detail="Only readable UTF-8 text files can be edited.",
+        )
+
+    if "\x00" in original_content or "\x00" in request.new_content:
+        raise HTTPException(status_code=415, detail="Binary content is not supported.")
+
+    if original_content == request.new_content:
+        return {"changed": False, "message": "File already has this content."}
+
+    proposal_id = secrets.token_urlsafe(24)
+    original_hash = hashlib.sha256(
+        original_content.encode("utf-8")
+    ).hexdigest()
+
+    diff = list(difflib.unified_diff(
+        original_content.splitlines(),
+        request.new_content.splitlines(),
+        fromfile=f"original/{target.name}",
+        tofile=f"proposed/{target.name}",
+        lineterm="",
+    ))
+
+    PENDING_EDITS[proposal_id] = {
+        "path": str(target),
+        "original_hash": original_hash,
+        "new_content": request.new_content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return {
+        "proposal_id": proposal_id,
+        "path": str(target),
+        "changed": True,
+        "diff": diff,
+        "approval_required": True,
+        "message": "Review the diff. The original file has not been changed.",
+    }
+
+
+@app.post("/api/agent/files/apply-edit")
+def apply_file_edit(request: ApplyEditRequest):
+    if not request.approve:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit approval is required to apply this edit.",
+        )
+
+    proposal = PENDING_EDITS.get(request.proposal_id)
+    if not proposal:
+        raise HTTPException(
+            status_code=404,
+            detail="Proposal not found or expired after a server restart.",
+        )
+
+    target = resolve_agent_path(proposal["path"])
+
+    if not target.is_file() or target.is_symlink():
+        raise HTTPException(status_code=403, detail="Target is no longer a regular file.")
+
+    current_content = target.read_text(encoding="utf-8")
+    current_hash = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
+
+    if current_hash != proposal["original_hash"]:
+        PENDING_EDITS.pop(request.proposal_id, None)
+        raise HTTPException(
+            status_code=409,
+            detail="File changed after proposal creation. Prepare a fresh edit.",
+        )
+
+    new_content = proposal["new_content"]
+    backup_dir = AGENT_ROOT / ".vantex_backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_path = backup_dir / f"{target.name}.{timestamp}.bak"
+    backup_path.write_text(current_content, encoding="utf-8")
+
+    temp_path = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+
+    try:
+        temp_path.write_text(new_content, encoding="utf-8")
+        os.replace(temp_path, target)
+
+        verified_content = target.read_text(encoding="utf-8")
+        if verified_content != new_content:
+            raise OSError("Post-write verification failed.")
+
+    except Exception as error:
+        try:
+            if backup_path.exists():
+                os.replace(backup_path, target)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Edit failed or verification failed: {str(error)[:200]}",
+        ) from error
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    PENDING_EDITS.pop(request.proposal_id, None)
+
+    return {
+        "success": True,
+        "path": str(target),
+        "verified": True,
+        "backup_path": str(backup_path),
+        "message": "Approved edit applied and verified.",
+    }
+
+import re
+from pydantic import Field
+
+
+class AgentCommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/api/agent/command")
+async def run_agent_command(request: AgentCommandRequest):
+    command = request.command.strip()
+    lowered = command.casefold()
+
+    # Natural-language PC file commands
+    open_words = ("open", "open file", "kholo", "khol", "khul")
+
+    # Latest screenshot: show its location or open it.
+    if (
+        ("screenshot" in lowered or "screen shot" in lowered or " ss " in f" {lowered} ")
+        and any(word in lowered for word in ("latest", "last", "newest", "recent", "sabse nayi", "latest wali"))
+    ):
+        screenshot = latest_pc_screenshot()
+
+        if any(word in lowered for word in ("open", "kholo", "khol", "khul")):
+            opened = open_pc_file(OpenPcFileRequest(path=screenshot["path"]))
+            return {
+                "command": command,
+                "action": "open_latest_screenshot",
+                "result": opened,
+            }
+
+        return {
+            "command": command,
+            "action": "latest_screenshot",
+            "result": screenshot,
+        }
+
+    # Hindi/English file search, optionally restricted to one approved folder.
+    folder_names = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+
+    detected_folder = next(
+        (value for key, value in folder_names.items()
+         if re.search(rf"\b{key}\b", lowered)),
+        None,
+    )
+
+    folder_search = re.search(
+        r"(.+?)\s+(?:mein|me|par|pe)\s+(.+?)\s+(?:wali|waali)\s+files?\s+(?:de|dikha|dikhao|bata|batao|show)",
+        lowered,
+    )
+
+    if folder_search:
+        folder_from_command = folder_names.get(folder_search.group(1).strip())
+        if folder_from_command:
+            detected_folder = folder_from_command
+            query = folder_search.group(2).strip()
+            result = search_pc_files(query, folder=detected_folder)
+            return {
+                "command": command,
+                "action": "search_pc_files",
+                "result": result,
+            }
+
+    hindi_search = re.fullmatch(
+        r"(.+?)\s+(?:wali|waali)\s+(?:(?:saari|sari)\s+)?files?\s+(?:de|dikha|dikhao|bata|batao|show)",
+        lowered,
+    )
+
+    english_search = re.fullmatch(
+        r"(?:find|search|show|list)\s+(?:all\s+)?(?:pc\s+)?files?\s+(?:named|matching|for|about)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if hindi_search or english_search:
+        query = (
+            hindi_search.group(1).strip()
+            if hindi_search
+            else english_search.group(1).strip()
+        )
+        result = search_pc_files(query, folder=detected_folder)
+        return {
+            "command": command,
+            "action": "search_pc_files",
+            "result": result,
+        }
+
+
+    # Open a resume by searching its extracted PDF content.
+    resume_content_request = (
+        "resume" in lowered
+        and any(word in lowered for word in ("open", "kholo", "khol", "khul"))
+        and any(term in lowered for term in (
+            "sentinelforge", "sentinel forge", "sentinel-forge",
+            "sabse zyada content", "most content", "maximum content",
+            "longest resume", "sabse detailed"
+        ))
+    )
+
+    if resume_content_request:
+        from pypdf import PdfReader
+
+        want_most_content = any(term in lowered for term in (
+            "sabse zyada content", "most content", "maximum content",
+            "longest resume", "sabse detailed"
+        ))
+        query = None if want_most_content else "sentinelforge"
+        candidates = []
+        scanned = 0
+
+        for item in scan_pc_files():
+            path = Path(item["path"])
+            if path.suffix.casefold() != ".pdf":
+                continue
+            filename = path.name.casefold()
+            if "resume" not in filename and "kushagra" not in filename and "cv" not in filename:
+                continue
+            scanned += 1
+            if scanned > 500:
+                break
+
+            try:
+                safe_path = resolve_pc_file(str(path))
+                reader = PdfReader(str(safe_path))
+                extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+                normalized = re.sub(r"[^a-z0-9]", "", extracted.casefold())
+
+                if query and query not in normalized:
+                    continue
+
+                candidates.append({
+                    "path": str(safe_path),
+                    "name": path.name,
+                    "words": len(extracted.split()),
+                    "characters": len(extracted),
+                    "pages": len(reader.pages),
+                })
+            except Exception:
+                continue
+
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail="No matching resume PDF content was found in approved folders."
+            )
+
+        selected = (
+            max(candidates, key=lambda item: item["words"])
+            if want_most_content
+            else candidates[0]
+        )
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_resume_by_content",
+            "selection": selected,
+            "candidates_checked": scanned,
+            "read_only_search": True,
+            "result": opened,
+        }
+
+    # Open the latest matching file by modification date.
+    latest_resume_request = (
+        "resume" in lowered
+        and any(word in lowered for word in (
+            "latest", "last", "newest", "recent",
+            "sabse nayi", "sabse latest"
+        ))
+        and any(word in lowered for word in (
+            "open", "kholo", "khol", "khul"
+        ))
+    )
+
+    if latest_resume_request:
+        result = search_pc_files("resume")
+        matches = [
+            item for item in result["matches"]
+            if Path(item["name"]).suffix.casefold() in {
+                ".pdf", ".doc", ".docx", ".odt"
+            }
+        ]
+
+        if not matches:
+            raise HTTPException(
+                status_code=404,
+                detail="No resume documents found in approved folders."
+            )
+
+        selected = max(
+            matches,
+            key=lambda item: item.get("modified_at", "")
+        )
+
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_latest_resume",
+            "result": opened,
+        }
+
+    # Open a named file, optionally restricted to an approved folder.
+    folder_open_match = re.fullmatch(
+        r"(.+?)\s+(?:mein|me|par|pe)\s+(.+?)\s+(?:open|kholo|khol|khul)(?:\s+kar)?",
+        lowered,
+    )
+
+    if folder_open_match:
+        folder_label = folder_open_match.group(1).strip()
+        target = folder_open_match.group(2).strip()
+
+        folder_aliases = {
+            "desktop": "Desktop",
+            "downloads": "Downloads",
+            "documents": "Documents",
+            "pictures": "Pictures",
+            "videos": "Videos",
+        }
+        selected_folder = folder_aliases.get(folder_label)
+
+        if selected_folder:
+            result = search_pc_files(target, folder=selected_folder)
+            matches = result["matches"]
+
+            exact = [
+                item for item in matches
+                if item["name"].casefold() == target.casefold()
+            ]
+
+            if len(exact) == 1:
+                selected = exact[0]
+            elif len(matches) == 1:
+                selected = matches[0]
+            else:
+                return {
+                    "command": command,
+                    "action": "select_file",
+                    "selection_required": True,
+                    "message": (
+                        "No matching file found."
+                        if not matches
+                        else "Multiple files match. Choose the exact file path."
+                    ),
+                    "result": result,
+                }
+
+            opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+            return {
+                "command": command,
+                "action": "open_pc_file",
+                "result": opened,
+            }
+
+    # Open a named file only if there is one unambiguous match.
+    open_match = re.fullmatch(
+        r"(?:open(?:\s+file)?|kholo|khol|khul)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if open_match:
+        target = open_match.group(1).strip()
+
+        if target.casefold() in {
+            "latest screenshot", "latest ss", "last screenshot",
+            "last ss", "newest screenshot",
+        }:
+            screenshot = latest_pc_screenshot()
+            opened = open_pc_file(OpenPcFileRequest(path=screenshot["path"]))
+            return {
+                "command": command,
+                "action": "open_latest_screenshot",
+                "result": opened,
+            }
+
+        result = search_pc_files(target)
+        matches = result["matches"]
+
+        exact = [
+            item for item in matches
+            if item["name"].casefold() == target.casefold()
+        ]
+
+        if len(exact) == 1:
+            selected = exact[0]
+        elif len(matches) == 1:
+            selected = matches[0]
+        else:
+            return {
+                "command": command,
+                "action": "select_file",
+                "selection_required": True,
+                "message": (
+                    "No matching file found."
+                    if not matches
+                    else "Multiple files match. Choose the exact file path."
+                ),
+                "result": result,
+            }
+
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_pc_file",
+            "result": opened,
+        }
+
+    # 1. System status
+    if lowered in {"system status", "pc status", "check system"}:
+        return {
+            "command": command,
+            "action": "system_status",
+            "result": get_system_status(),
+        }
+
+    # 2. List approved project files
+    if lowered in {"list files", "show files", "list project files"}:
+        return {
+            "command": command,
+            "action": "list_files",
+            "result": list_agent_files(),
+        }
+
+    # 3. Search by filename
+    match = re.fullmatch(
+        r"(?:find|search)(?: file)?\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        query = match.group(1).strip()
+        return {
+            "command": command,
+            "action": "search_files",
+            "result": search_agent_files(query),
+        }
+
+    # 4. Read a text file within the approved project root
+    match = re.fullmatch(
+        r"read file\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        path = match.group(1).strip()
+        return {
+            "command": command,
+            "action": "read_file",
+            "result": read_agent_file(path),
+        }
+
+    # 5. Website QA
+    match = re.fullmatch(
+        r"test website\s+(https?://\S+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        url = match.group(1).strip()
+        try:
+            request_model = WebsiteTestRequest(url=url)
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="Invalid website URL.") from error
+
+        return {
+            "command": command,
+            "action": "website_qa",
+            "result": await test_website(request_model),
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Command not supported yet. Try: system status, list files, "
+            "find file Home.tsx, read file apps/web/src/App.tsx, "
+            "or test website http://localhost:5173"
+        ),
+    )
+
+
+from fastapi import HTTPException
+
+MONITOR_STATUS_PATH = (
+    Path.home() / ".local" / "state" / "vantex" / "status.json"
+)
+
+
+@app.get("/api/agent/monitor/status")
+def get_monitor_status():
+    if not MONITOR_STATUS_PATH.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="VANTEX monitor status is not available yet.",
+        )
+
+    try:
+        import json
+
+        with MONITOR_STATUS_PATH.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read VANTEX monitor status.",
+        )
+
+
+# VANTEX File Operator — separate read/search/open permissions
+import subprocess
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+PC_FILE_ROOTS = [
+    (Path.home() / name).resolve()
+    for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos")
+    if (Path.home() / name).is_dir()
+]
+
+PC_SKIP_DIRS = {"venv", "env", ".tox", 
+    ".git", ".venv", "node_modules", "__pycache__",
+    "dist", "build", ".cache", ".local"
+}
+
+PC_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+PC_SCAN_LIMIT = 20000
+
+
+def resolve_pc_file(raw_path: str) -> Path:
+    """Resolve a file only inside approved personal folders."""
+    candidate = Path(raw_path).expanduser()
+
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file():
+            raise ValueError("Not a regular file")
+
+        if not any(
+            resolved.is_relative_to(root)
+            for root in PC_FILE_ROOTS
+        ):
+            raise ValueError("Outside approved folders")
+
+        return resolved
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(
+            status_code=403,
+            detail="File is missing or outside VANTEX approved folders."
+        )
+
+
+def scan_pc_files():
+    # Give every approved root its own scan budget so a large
+    # Desktop tree cannot prevent Pictures from being scanned.
+    for root in PC_FILE_ROOTS:
+        scanned = 0
+
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [
+                name for name in dirs
+                if name not in PC_SKIP_DIRS
+                and not name.startswith(".")
+                and not (Path(current) / name).is_symlink()
+            ]
+
+            for name in files:
+                candidate = Path(current) / name
+
+                if name.startswith(".") or candidate.is_symlink():
+                    continue
+
+                scanned += 1
+                if scanned > PC_SCAN_LIMIT:
+                    dirs[:] = []
+                    break
+
+                try:
+                    resolved = candidate.resolve(strict=True)
+
+                    if not any(
+                        resolved.is_relative_to(approved_root)
+                        for approved_root in PC_FILE_ROOTS
+                    ):
+                        continue
+
+                    stat = resolved.stat()
+                    if not resolved.is_file():
+                        continue
+
+                    yield {
+                        "name": resolved.name,
+                        "path": str(resolved),
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            stat.st_mtime
+                        ).astimezone().isoformat(),
+                        "_mtime": stat.st_mtime,
+                    }
+                except (OSError, ValueError, RuntimeError):
+                    continue
+
+
+def calculate_file_sha256(file_path: str) -> str:
+    """Read a file in chunks and return its SHA-256 hash."""
+    digest = hashlib.sha256()
+
+    with open(file_path, "rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+@app.get("/api/agent/pc-files/duplicates")
+def find_pc_file_duplicates(
+    min_size_bytes: int = Query(default=1, ge=1),
+):
+    """
+    Read-only duplicate scan.
+    Files are considered duplicates only when size and SHA-256 match.
+    No files are moved, edited, or deleted.
+    """
+    candidates_by_size = {}
+
+    for item in scan_pc_files():
+        size = item["size_bytes"]
+
+        if size < min_size_bytes:
+            continue
+
+        candidates_by_size.setdefault(size, []).append(item)
+
+    duplicate_groups = []
+    files_hashed = 0
+    bytes_hashed = 0
+
+    for size, items in candidates_by_size.items():
+        if len(items) < 2:
+            continue
+
+        candidates_by_hash = {}
+
+        for item in items:
+            try:
+                current_path = resolve_pc_file(item["path"])
+
+                # Avoid hashing a file that changed after the scan.
+                if current_path.stat().st_size != size:
+                    continue
+
+                file_hash = calculate_file_sha256(str(current_path))
+                files_hashed += 1
+                bytes_hashed += size
+
+                candidates_by_hash.setdefault(file_hash, []).append(item)
+
+            except (OSError, ValueError, RuntimeError, HTTPException):
+                continue
+
+        for file_hash, group in candidates_by_hash.items():
+            if len(group) < 2:
+                continue
+
+            for item in group:
+                item.pop("_mtime", None)
+
+            duplicate_groups.append({
+                "sha256": file_hash,
+                "size_bytes": size,
+                "copies": len(group),
+                "files": sorted(group, key=lambda item: item["path"]),
+            })
+
+    duplicate_groups.sort(
+        key=lambda group: (
+            group["size_bytes"] * (group["copies"] - 1),
+            group["size_bytes"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "read_only": True,
+        "files_hashed": files_hashed,
+        "bytes_hashed": bytes_hashed,
+        "duplicate_groups": duplicate_groups,
+        "duplicate_group_count": len(duplicate_groups),
+        "duplicate_copy_count": sum(
+            group["copies"] for group in duplicate_groups
+        ),
+        "potential_reclaimable_bytes": sum(
+            group["size_bytes"] * (group["copies"] - 1)
+            for group in duplicate_groups
+        ),
+        "note": "No files were modified or deleted.",
+    }
+
+
+
+@app.get("/api/agent/pc-files/search-content")
+def search_pc_pdf_content(
+    query: str = Query(min_length=1, max_length=200),
+    folder: str | None = Query(default=None, max_length=50),
+):
+    """Read-only search inside text-based PDF files in approved PC folders."""
+    from pypdf import PdfReader
+
+    needle = re.sub(r"[^a-z0-9]", "", query.casefold())
+    if not needle:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    allowed = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+    selected_folder = None
+    if folder:
+        selected_folder = allowed.get(folder.strip().casefold())
+        if selected_folder is None:
+            raise HTTPException(status_code=400, detail="Unsupported folder.")
+
+    matches = []
+    scanned = 0
+
+    for item in scan_pc_files():
+        path = Path(item["path"])
+        if path.suffix.casefold() != ".pdf":
+            continue
+
+        if selected_folder and path.parts[len(Path.home().parts)] != selected_folder:
+            continue
+
+        # Limit this content search to likely resume/CV PDFs.
+        filename = path.name.casefold()
+        if "resume" not in filename and "cv" not in filename and "kushagra" not in filename:
+            continue
+
+        scanned += 1
+        if scanned > 500:
+            break
+
+        try:
+            safe_path = resolve_pc_file(str(path))
+            reader = PdfReader(str(safe_path))
+            extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+            normalized = re.sub(r"[^a-z0-9]", "", extracted.casefold())
+
+            if needle in normalized:
+                matches.append({
+                    "name": path.name,
+                    "path": str(path),
+                    "pages": len(reader.pages),
+                    "characters": len(extracted),
+                    "words": len(extracted.split()),
+                })
+        except Exception:
+            continue
+
+    return {
+        "query": query,
+        "folder": selected_folder,
+        "scanned_pdfs": scanned,
+        "count": len(matches),
+        "matches": matches,
+        "read_only": True,
+    }
+
+
+@app.get("/api/agent/pc-files/search")
+def search_pc_files(
+    query: str = Query(min_length=1, max_length=200),
+    folder: str | None = Query(default=None, max_length=50),
+):
+    needle = query.strip().casefold()
+    if not needle:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    query_tokens = re.findall(r"[a-z0-9]+", needle)
+    matches = []
+
+    allowed_folder_names = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+
+    selected_folder = None
+    if folder:
+        selected_folder = allowed_folder_names.get(folder.strip().casefold())
+        if selected_folder is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported folder. Use Desktop, Downloads, Documents, Pictures, or Videos."
+            )
+
+    for item in scan_pc_files():
+        if selected_folder and Path(item["path"]).parts[
+            len(Path.home().parts)
+        ] != selected_folder:
+            continue
+
+        filename = item["name"].casefold()
+        filename_tokens = re.findall(r"[a-z0-9]+", filename)
+        stem = Path(filename).stem
+        stem_tokens = re.findall(r"[a-z0-9]+", stem)
+
+        if not query_tokens:
+            continue
+
+        matched_tokens = sum(
+            1 for token in query_tokens
+            if token in filename_tokens
+        )
+
+        # Strict matching: every query word must occur in the filename.
+        if matched_tokens != len(query_tokens):
+            continue
+
+        if needle in filename:
+            score = 100
+        else:
+            score = 80
+
+        # Prefer matching the main filename over an extension-only match.
+        if all(token in stem_tokens for token in query_tokens):
+            score += 10
+
+        # Small boost for common document types.
+        if Path(filename).suffix in {".pdf", ".doc", ".docx", ".odt"}:
+            score += 2
+
+        item["_score"] = score
+        matches.append(item)
+
+    # Relevance first; newer files break ties.
+    matches.sort(
+        key=lambda item: (item["_score"], item.get("_mtime", 0)),
+        reverse=True,
+    )
+
+    for item in matches:
+        item.pop("_mtime", None)
+        item.pop("_score", None)
+
+    return {
+        "query": query,
+        "folder": selected_folder,
+        "roots": (
+            [str(root) for root in PC_FILE_ROOTS
+             if not selected_folder or root.name == selected_folder]
+        ),
+        "matches": matches[:100],
+        "count": min(len(matches), 100),
+        "scan_limit": PC_SCAN_LIMIT,
+        "sorted_by": "relevance_then_modified_date",
+    }
+
+
+@app.get("/api/agent/pc-files/latest-screenshot")
+def latest_pc_screenshot():
+    screenshots = []
+
+    for item in scan_pc_files():
+        name = item["name"].casefold()
+        path = item["path"].casefold()
+
+        is_screenshot = (
+            item["name"].lower().endswith(tuple(PC_IMAGE_EXTENSIONS))
+            and (
+                "screenshot" in name
+                or "screen shot" in name
+                or "screenshots" in path
+            )
+        )
+
+        if is_screenshot:
+            screenshots.append(item)
+
+    if not screenshots:
+        raise HTTPException(
+            status_code=404,
+            detail="No screenshots found in approved folders."
+        )
+
+    latest = max(screenshots, key=lambda item: item["_mtime"])
+    latest.pop("_mtime", None)
+    return latest
+
+
+class OpenPcFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/api/agent/pc-files/open")
+def open_pc_file(request: OpenPcFileRequest):
+    file_path = resolve_pc_file(request.path)
+
+    try:
+        subprocess.Popen(
+            ["xdg-open", str(file_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not launch the default application: {error}"
+        ) from error
+
+    return {
+        "opened": True,
+        "name": file_path.name,
+        "path": str(file_path),
+        "message": "Open request sent to the default desktop application."
+    }
