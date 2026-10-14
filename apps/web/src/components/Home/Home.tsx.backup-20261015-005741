@@ -1,0 +1,1269 @@
+import { useState, type FormEvent, type ReactNode } from 'react';
+import './Home.css';
+
+const API = 'http://127.0.0.1:8000';
+
+type FileItem = {
+  name: string;
+  path: string;
+  type?: string;
+  preview?: string;
+};
+
+type ResultData = {
+  title: string;
+  message: string;
+  details?: string;
+  files?: FileItem[];
+  data?: unknown;
+};
+
+type HomeProps = {
+  onOpenIntelligence?: () => void;
+};
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  return null;
+}
+
+function getMessage(value: unknown, fallback = 'Request completed.'): string {
+  const obj = asObject(value);
+
+  if (!obj) {
+    return typeof value === 'string' ? value : fallback;
+  }
+
+  const message =
+    obj.message ??
+    obj.detail ??
+    obj.output ??
+    obj.result ??
+    obj.status ??
+    obj.description;
+
+  if (typeof message === 'string') {
+    return message;
+  }
+
+  if (message && typeof message === 'object') {
+    return getMessage(message, fallback);
+  }
+
+  return fallback;
+}
+
+function findFileItems(value: unknown, depth = 0): FileItem[] {
+  if (depth > 5 || value == null) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item): FileItem | null => {
+        if (typeof item === 'string') {
+          return {
+            name: item.split('/').pop() || item,
+            path: item,
+          };
+        }
+
+        const obj = asObject(item);
+
+        if (!obj) {
+          return null;
+        }
+
+        const path = [
+          obj.path,
+          obj.full_path,
+          obj.absolute_path,
+          obj.file_path,
+          obj.location,
+        ].find((entry): entry is string => typeof entry === 'string');
+
+        const name = [
+          obj.name,
+          obj.filename,
+          obj.file_name,
+        ].find((entry): entry is string => typeof entry === 'string');
+
+        if (!path && !name) {
+          return null;
+        }
+
+        const finalPath = path || name || '';
+
+        return {
+          name: name || finalPath.split('/').pop() || finalPath,
+          path: finalPath,
+          type:
+            typeof obj.type === 'string'
+              ? obj.type
+              : typeof obj.kind === 'string'
+                ? obj.kind
+                : undefined,
+          preview:
+            typeof obj.preview === 'string'
+              ? obj.preview
+              : typeof obj.snippet === 'string'
+                ? obj.snippet
+                : typeof obj.content_preview === 'string'
+                  ? obj.content_preview
+                  : undefined,
+        };
+      })
+      .filter((item): item is FileItem => item !== null);
+  }
+
+  const obj = asObject(value);
+
+  if (!obj) {
+    return [];
+  }
+
+  for (const key of [
+    'matches',
+    'files',
+    'items',
+    'results',
+    'entries',
+    'data',
+    'result',
+  ]) {
+    if (obj[key] !== undefined) {
+      const found = findFileItems(obj[key], depth + 1);
+
+      if (found.length) {
+        return found;
+      }
+    }
+  }
+
+  return [];
+}
+
+function getHostname(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+function normalizeUrl(text: string): string | null {
+  const match = text.match(
+    /https?:\/\/[^\s"'<>]+|(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+(?:\/[^\s"'<>]*)?/i,
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  let url = match[0].replace(/[.,!?;]+$/, '');
+
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url}`;
+  }
+
+  try {
+    return new URL(url).toString();
+  } catch {
+    return null;
+  }
+}
+
+
+function detectIntent(input: string) {
+  const text = input.trim();
+  const url = normalizeUrl(text);
+
+  // Website QA
+  const hasWebsiteTest =
+    /\b(test|check|qa|audit|inspect)\b/i.test(text) &&
+    Boolean(url);
+
+  if (hasWebsiteTest) {
+    return { type: 'website' as const, url };
+  }
+
+  // PC / system information
+  const isPCStatus =
+    /\b(pc status|system status|system info|system information|pc info|computer status|hardware status|show my pc|my system)\b/i.test(text);
+
+  if (isPCStatus) {
+    return { type: 'system' as const };
+  }
+
+  // Explicit content search must be checked BEFORE filename search.
+  const contentPatterns = [
+    // Search files with Auralink
+    /^(?:please\s+)?(?:search|find|look for)\s+(?:all\s+)?files?\s+(?:with|containing|that contain|mentioning)\s+(.+)$/i,
+
+    // Search operating system files for paging
+    /^(?:please\s+)?(?:search|find|look for)\s+(.+?)\s+files?\s+for\s+(.+)$/i,
+
+    // Search resume for operating system
+    /^(?:please\s+)?(?:search|find|look for)\s+(?:the\s+)?(resumes?|cvs?)\s+for\s+(.+)$/i,
+
+    // Search inside files for paging
+    /^(?:please\s+)?(?:search inside|search within|search content|find text)\s+(.+)$/i,
+
+    // Find text Auralink inside files
+    /^(?:please\s+)?find text\s+(.+?)\s+inside files?$/i,
+
+    // Find a phrase in file contents
+    /^(?:please\s+)?(?:find|search for)\s+(.+?)\s+in\s+(?:the\s+)?(?:file contents|file content|documents?)$/i,
+  ];
+
+  for (const pattern of contentPatterns) {
+    const match = text.match(pattern);
+
+    if (!match) continue;
+
+    let query = text;
+
+    // Category + content query
+    if (
+      pattern === contentPatterns[1] ||
+      pattern === contentPatterns[2]
+    ) {
+      query = text;
+    } else {
+      query = text;
+    }
+
+    return {
+      type: 'content' as const,
+      query,
+    };
+  }
+
+  // Open / launch a file or folder
+  const isOpen =
+    /^(?:please\s+)?(?:open|launch|show|khol|kholo|khul)\b/i.test(text) ||
+    /\b(?:open|kholo|khol|khul)\s+(?:the\s+)?(?:file|folder)\b/i.test(text) ||
+    /\b(?:latest|last|newest|most recent)\b.*\b(file|folder|document|pdf)\b.*\b(open|kholo|khol|khul)\b/i.test(text);
+
+  if (isOpen) {
+    const query = text
+      .replace(/\b(open|launch|show|khol|kholo|khul)\b/gi, ' ')
+      .replace(/\b(please|the|file|folder|kar|do|krr|latest|last|newest|recent)\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return {
+      type: 'open' as const,
+      query: query || text,
+    };
+  }
+
+  // General content searches
+  const isContentSearch =
+    /\b(search inside|search within|inside files|in file contents|search content|find text|find function|find code|search for|where is|look for)\b/i.test(text);
+
+  if (isContentSearch) {
+    const query = text
+      .replace(
+        /^(please\s+)?(search inside|search within|inside files|in file contents|search content|find text|find function|find code|search for|find|where is|look for)\s*/i,
+        '',
+      )
+      .replace(
+        /\b(in my project|in the project|inside my project|inside the project|in files|inside files)\b/gi,
+        '',
+      )
+      .trim();
+
+    return {
+      type: 'content' as const,
+      query: query || text,
+    };
+  }
+
+
+  // Search inside resume/CV files using any user-provided term.
+  const resumeContentMatch = text.match(
+    /^(?:please\s+)?(?:search|find|look for)\s+(?:the\s+)?(resume|resumes|cv|cvs)\s+(?:for|with|containing|mentioning)\s+(.+)$/i,
+  );
+
+  if (resumeContentMatch) {
+    return {
+      type: 'content' as const,
+      query: text,
+    };
+  }
+
+
+  // Filename / folder search
+  const isFileSearch =
+    /\b(find|search|locate|list|show|dikha|dikhao|dikhaye|bata|batao|de|do|nikal|nikaal|dhoondh|dhundh|dhundho|khoj)\b/i.test(text) &&
+    /\b(file|files|folder|folders|document|documents|resume|resumes|cv|cvs|pdf|python|javascript|typescript|css|html|json|tsx|ts|jsx|js|py|md)\b/i.test(text);
+
+  if (isFileSearch) {
+    const query = text
+      .replace(
+        /\b(please|mujhe|mera|meri|mere|saari|saare|sari|sare|sabhi|sab|all|my|the|for|find|search|locate|list|show|give|me|de|do|dikha|dikhao|dikhaye|bata|batao|dhoondh|dhundh|dhundho|khoj|nikaal|nikal|files|file|folders|folder|documents|document|resumes|resume|cvs|cv|in my pc|on my pc|on my computer)\b/gi,
+        ' ',
+      )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return {
+      type: 'files' as const,
+      query: query || text,
+    };
+  }
+
+  // Short/general file-related requests, including "resume"
+  const soundsLikeFileRequest =
+    /\b(file|files|folder|folders|document|documents|code|source code|project file|resume|resumes|cv|cvs|pdf|tsx|jsx|typescript|javascript)\b/i.test(text) ||
+    /\b(dhoondh|dhundh|dhundho|dikha|dikhao|bata|batao|de do|nikal|nikaal|khoj)\b/i.test(text);
+
+  if (soundsLikeFileRequest) {
+    const query = text
+      .replace(
+        /\b(please|mujhe|mera|meri|mere|saari|saare|sari|sare|sabhi|sab|all|my|the|for|find|search|locate|list|show|give|me|de|do|dikha|dikhao|dikhaye|bata|batao|dhoondh|dhundh|dhundho|khoj|nikaal|nikal|wali|wala|waali|waala|files|file|folders|folder|documents|document|resumes|resume|cvs|cv|in my pc|on my pc|on my computer)\b/gi,
+        ' ',
+      )
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return {
+      type: 'files' as const,
+      query: query || text,
+    };
+  }
+
+  // Fallback: send other commands to the local agent.
+  return {
+    type: 'command' as const,
+    command: text,
+  };
+}
+
+
+async function requestJSON(
+  url: string,
+  options?: RequestInit,
+): Promise<unknown> {
+  const response = await fetch(url, options);
+  const text = await response.text();
+
+  let body: unknown;
+
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = text;
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      getMessage(body, `Request failed (${response.status})`),
+    );
+  }
+
+  return body;
+}
+
+function getResultMessage(value: unknown, fallback: string): string {
+  const obj = asObject(value);
+
+  if (!obj) {
+    return typeof value === 'string' ? value : fallback;
+  }
+
+  const candidates = [
+    obj.message,
+    obj.detail,
+    obj.output,
+    obj.description,
+    obj.status,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate;
+    }
+  }
+
+  return fallback;
+}
+
+function Icon({
+  name,
+  size = 20,
+}: {
+  name: 'spark' | 'search' | 'file' | 'external' | 'check' | 'monitor';
+  size?: number;
+}) {
+  const common = {
+    width: size,
+    height: size,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.7,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true as const,
+  };
+
+  const paths: Record<string, ReactNode> = {
+    spark: (
+      <>
+        <path d="m12 3 1.9 5.8L20 11l-6.1 2.2L12 19l-2-5.8L4 11l6-2.2L12 3Z" />
+        <path d="m19 14 1.1 2.9L23 18l-2.9 1.1L19 22l-1.1-2.9L15 18l2.9-1.1L19 14Z" />
+      </>
+    ),
+    search: (
+      <>
+        <circle cx="10.8" cy="10.8" r="6.8" />
+        <path d="m16 16 4.5 4.5" />
+      </>
+    ),
+    file: (
+      <>
+        <path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10Z" />
+        <path d="M13 3v7h7M8 15h8M8 18h6" />
+      </>
+    ),
+    external: (
+      <>
+        <path d="M14 4h6v6M20 4l-9 9" />
+        <path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5" />
+      </>
+    ),
+    check: <path d="m5 12 4 4L19 6" />,
+    monitor: (
+      <>
+        <rect x="3" y="4" width="18" height="13" rx="2" />
+        <path d="M8 21h8M12 17v4" />
+      </>
+    ),
+  };
+
+  return <svg {...common}>{paths[name]}</svg>;
+}
+
+
+type ResponsiveCheck = {
+  name: string;
+  width: number;
+  height: number;
+  passed: boolean;
+  horizontal_overflow: boolean;
+  viewport_width: number;
+  document_width: number;
+  overflowing_elements: {
+    element: string;
+    left: number;
+    right: number;
+    width: number;
+  }[];
+};
+
+function WebsiteQAReport({ data }: { data: unknown }) {
+  const report = asObject(data);
+
+  if (!report) return null;
+
+  const summary = asObject(report.summary);
+  const checks = Array.isArray(report.responsive_checks)
+    ? report.responsive_checks.filter(
+      (item): item is ResponsiveCheck => {
+        const check = asObject(item);
+        return (
+          check !== null &&
+          typeof check.name === 'string' &&
+          typeof check.passed === 'boolean'
+        );
+      },
+    )
+    : [];
+
+  const count = (key: string) =>
+    typeof summary?.[key] === 'number' ? summary[key] as number : 0;
+
+  const success = report.success === true;
+  const responsivePassed =
+    checks.length > 0 && checks.every((check) => check.passed);
+
+  const metrics = [
+    { label: 'Console errors', value: count('console_error_count') },
+    { label: 'Page errors', value: count('page_error_count') },
+    { label: 'Failed requests', value: count('failed_request_count') },
+    { label: 'Broken links', value: count('broken_link_count') },
+  ];
+
+  return (
+    <section className="qa-report" aria-label="Website QA report">
+      <div className="qa-report-heading">
+        <div>
+          <span className="qa-eyebrow">AUTOMATED WEBSITE AUDIT</span>
+          <h3>Test overview</h3>
+        </div>
+        <span className={`qa-status ${success ? 'is-pass' : 'is-fail'}`}>
+          <span className="qa-status-dot" />
+          {success ? 'TEST COMPLETED' : 'TEST FAILED'}
+        </span>
+      </div>
+
+      <div className="qa-metrics">
+        {metrics.map((metric) => (
+          <article className="qa-metric" key={metric.label}>
+            <span>{metric.label}</span>
+            <strong className={metric.value > 0 ? 'has-issues' : ''}>
+              {metric.value}
+            </strong>
+          </article>
+        ))}
+      </div>
+
+      <div className="qa-responsive">
+        <div className="qa-section-heading">
+          <div>
+            <h3>Responsive checks</h3>
+            <p>Horizontal overflow detection</p>
+          </div>
+          <span
+            className={`qa-status ${responsivePassed ? 'is-pass' : 'is-neutral'
+              }`}
+          >
+            {checks.length > 0
+              ? `${checks.filter((check) => check.passed).length}/${checks.length} PASSED`
+              : 'NOT AVAILABLE'}
+          </span>
+        </div>
+
+        {checks.length > 0 && (
+          <div className="qa-viewport-grid">
+            {checks.map((check) => (
+              <article className="qa-viewport" key={check.name}>
+                <div className="qa-viewport-top">
+                  <span className="qa-device-icon">
+                    {check.name === 'mobile'
+                      ? '▯'
+                      : check.name === 'tablet'
+                        ? '▤'
+                        : '▭'}
+                  </span>
+                  <span
+                    className={`qa-mini-status ${check.passed ? 'is-pass' : 'is-fail'
+                      }`}
+                  >
+                    {check.passed ? 'PASS' : 'FAIL'}
+                  </span>
+                </div>
+
+                <h4>
+                  {check.name.charAt(0).toUpperCase() + check.name.slice(1)}
+                </h4>
+                <p>{check.width} × {check.height}</p>
+
+                <div className="qa-width-detail">
+                  <span>Viewport width</span>
+                  <strong>{check.viewport_width}px</strong>
+                </div>
+                <div className="qa-width-detail">
+                  <span>Document width</span>
+                  <strong>{check.document_width}px</strong>
+                </div>
+
+                {check.horizontal_overflow && (
+                  <details className="qa-overflow-details">
+                    <summary>
+                      {check.overflowing_elements.length} detected elements
+                    </summary>
+                    <ul>
+                      {check.overflowing_elements.map((element, index) => (
+                        <li key={`${element.element}-${index}`}>
+                          <code>{element.element}</code>
+                          <span>
+                            Left: {element.left}px · Right: {element.right}px
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </article>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <details className="technical-details qa-raw-details">
+        <summary>Full QA response</summary>
+        <pre>{JSON.stringify(data, null, 2)}</pre>
+      </details>
+    </section>
+  );
+}
+
+
+function ResultCard({
+  title,
+  message,
+  children,
+  onClear,
+}: {
+  title: string;
+  message: string;
+  children?: ReactNode;
+  onClear: () => void;
+}) {
+  return (
+    <section className="result-panel">
+      <div className="result-heading">
+        <div className="result-icon">
+          <Icon name="spark" size={18} />
+        </div>
+
+        <div className="result-heading-text">
+          <span className="result-eyebrow">VANTEX RESPONSE</span>
+          <h2>{title}</h2>
+        </div>
+
+        <button
+          type="button"
+          className="result-close"
+          onClick={onClear}
+          aria-label="Clear result"
+        >
+          ×
+        </button>
+      </div>
+
+      <p className="result-message">{message}</p>
+      {children}
+    </section>
+  );
+}
+
+function FileResults({
+  files,
+  onOpen,
+  openingPath,
+}: {
+  files: FileItem[];
+  onOpen: (file: FileItem) => void;
+  openingPath: string;
+}) {
+  if (!files.length) {
+    return (
+      <div className="empty-results">
+        <Icon name="search" size={24} />
+        <p>No matching files found.</p>
+        <span>
+          Try a filename, extension, or a more specific description.
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="file-results">
+      {files.map((file, index) => (
+        <article
+          className="file-result"
+          key={`${file.path}-${index}`}
+        >
+          <div className="file-result-icon">
+            <Icon name="file" size={21} />
+          </div>
+
+          <div className="file-result-info">
+            <h3>{file.name}</h3>
+            <p className="file-path" title={file.path}>
+              {file.path}
+            </p>
+
+            {file.preview && (
+              <p className="file-preview">{file.preview}</p>
+            )}
+          </div>
+
+          <button
+            className="file-open-button"
+            type="button"
+            onClick={() => onOpen(file)}
+            disabled={openingPath === file.path}
+          >
+            {openingPath === file.path ? 'Opening…' : 'Open'}
+            {openingPath !== file.path && (
+              <Icon name="external" size={15} />
+            )}
+          </button>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+export default function Home({ onOpenIntelligence }: HomeProps) {
+  const [command, setCommand] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<ResultData | null>(null);
+  const [openingPath, setOpeningPath] = useState('');
+  const [history, setHistory] = useState<string[]>([]);
+
+  function clearResult() {
+    setResult(null);
+    setError('');
+  }
+
+  async function searchFiles(query: string, contentSearch = false) {
+    console.log("[VANTEX] Search query:", query);
+    console.log("[VANTEX] Content search:", contentSearch);
+    const endpoint = contentSearch
+      ? '/api/agent/pc-files/search-content'
+      : '/api/agent/pc-files/search';
+
+    const url = `${API}${endpoint}?${new URLSearchParams({
+      query,
+    }).toString()}`;
+
+    const data = await requestJSON(url);
+    const files = findFileItems(data);
+
+    setResult({
+      title: contentSearch
+        ? 'Content search results'
+        : 'File search results',
+      message: files.length
+        ? `Found ${files.length} matching ${files.length === 1 ? 'result' : 'results'
+        }.`
+        : getResultMessage(data, 'No matching files were found.'),
+      files,
+      data,
+    });
+  }
+
+  async function openFile(file: FileItem) {
+    setOpeningPath(file.path);
+    setError('');
+
+    try {
+      const data = await requestJSON(`${API}/api/agent/pc-files/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: file.path }),
+      });
+
+      setResult({
+        title: 'Open file',
+        message: getResultMessage(
+          data,
+          `Open request sent for ${file.name}.`,
+        ),
+        details: file.path,
+      });
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Could not open this file.',
+      );
+    } finally {
+      setOpeningPath('');
+    }
+  }
+
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const input = command.trim();
+
+    if (!input || loading) {
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    setResult(null);
+
+    setHistory((previous) =>
+      [input, ...previous.filter((item) => item !== input)].slice(0, 4),
+    );
+
+    try {
+      const intent = detectIntent(input);
+      console.log('[VANTEX] Input:', input);
+      console.log('[VANTEX] Detected intent:', intent);
+
+      if (intent.type === 'website' && intent.url) {
+        const url = intent.url;
+
+        const data = await requestJSON(`${API}/api/qa/test`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+
+        const obj = asObject(data);
+        const rawTitle = obj?.title;
+        const rawStatus = obj?.http_status;
+
+        const title =
+          typeof rawTitle === 'string'
+            ? rawTitle
+            : getHostname(url);
+
+        const status =
+          typeof rawStatus === 'number'
+            ? `HTTP status: ${rawStatus}`
+            : '';
+
+        setResult({
+          title: 'Website test complete',
+          message: getResultMessage(
+            data,
+            `The website test request completed for ${title}.`,
+          ),
+          details: [url, status].filter(Boolean).join('\n'),
+          data,
+        });
+      } else if (intent.type === 'website') {
+        throw new Error('Please enter a valid website URL.');
+      } else if (intent.type === 'files') {
+        await searchFiles(intent.query);
+      } else if (intent.type === 'content') {
+        // Send the original command so the backend can apply
+        // category filters before searching file contents.
+        const data = await requestJSON(`${API}/api/agent/command`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: input }),
+        });
+
+        const obj = asObject(data);
+        const resultData = asObject(obj?.result);
+
+        const rawResults = Array.isArray(obj?.results)
+          ? obj.results
+          : Array.isArray(resultData?.results)
+            ? resultData.results
+            : [];
+
+        const files = rawResults
+          .filter(
+            (item): item is Record<string, unknown> =>
+              item !== null && typeof item === 'object',
+          )
+          .map((item) => ({
+            name: String(item.name ?? ''),
+            path: String(item.path ?? ''),
+          }))
+          .filter((file) => file.name && file.path);
+
+        setResult({
+          title: 'Content search results',
+          message:
+            files.length > 0
+              ? `Found ${files.length} matching files.`
+              : getResultMessage(
+                data,
+                'No files matched the requested category and content.',
+              ),
+          files,
+          data,
+        });
+      } else if (intent.type === 'open') {
+        const data = await requestJSON(`${API}/api/agent/command`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: input }),
+        });
+
+        const obj = asObject(data);
+        const action = obj?.action;
+        const selection = asObject(obj?.selection);
+        const resultData = asObject(obj?.result);
+
+        const openedActions = [
+          'open_file_by_content',
+          'open_pc_file',
+          'open_latest_resume',
+          'open_latest_screenshot',
+        ];
+
+        if (
+          typeof action === 'string' &&
+          openedActions.includes(action)
+        ) {
+          setResult({
+            title: 'File opened',
+            message: getResultMessage(
+              data,
+              'Open request sent to the default application.',
+            ),
+            details:
+              typeof selection?.path === 'string'
+                ? selection.path
+                : typeof resultData?.path === 'string'
+                  ? resultData.path
+                  : undefined,
+            data,
+          });
+        } else {
+          const rawResults = Array.isArray(obj?.results)
+            ? obj.results
+            : Array.isArray(resultData?.results)
+              ? resultData.results
+              : [];
+
+          const files = rawResults
+            .filter(
+              (item): item is Record<string, unknown> =>
+                item !== null && typeof item === 'object',
+            )
+            .map((item) => ({
+              name: String(item.name ?? ''),
+              path: String(item.path ?? ''),
+            }))
+            .filter((file) => file.name && file.path);
+
+          setResult({
+            title: 'Content search results',
+            message:
+              files.length > 0
+                ? 'Multiple files matched. Review the results before opening one.'
+                : getResultMessage(
+                  data,
+                  'No matching file content was found. Try a more specific phrase.',
+                ),
+            files,
+            data,
+          });
+        }
+      } else if (intent.type === 'system') {
+        const data = await requestJSON(`${API}/api/agent/system`);
+
+        setResult({
+          title: 'PC status',
+          message: getResultMessage(
+            data,
+            'System information retrieved.',
+          ),
+          data,
+        });
+      } else {
+        const data = await requestJSON(`${API}/api/agent/command`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: intent.command }),
+        });
+
+        const obj = asObject(data);
+        const resultData = asObject(obj?.result);
+        const rawResults = Array.isArray(obj?.results)
+          ? obj.results
+          : Array.isArray(resultData?.results)
+            ? resultData.results
+            : [];
+
+        const files = rawResults
+          .filter(
+            (item): item is Record<string, unknown> =>
+              item !== null && typeof item === 'object',
+          )
+          .map((item) => ({
+            name: String(item.name ?? ''),
+            path: String(item.path ?? ''),
+            preview: String(item.preview ?? ''),
+            type: String(item.extension ?? ''),
+          }))
+          .filter((file) => file.name && file.path);
+
+        const isContentSearch =
+          obj?.action === 'search_file_content' ||
+          resultData?.action === 'search_file_content';
+
+        setResult({
+          title: isContentSearch ? 'Content search results' : 'Command result',
+          message: isContentSearch
+            ? files.length
+              ? `Found ${files.length} matching files.`
+              : 'No matching file contents found.'
+            : getResultMessage(data, 'Your command was processed.'),
+          files: files.length ? files : undefined,
+          data,
+        });
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Something went wrong. Check that the VANTEX backend is running.',
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+
+
+  const systemData = asObject(result?.data);
+
+  const systemEntries = systemData
+    ? Object.entries(systemData).filter(
+      ([, value]) =>
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'boolean',
+    )
+    : [];
+
+  return (
+    <main className="home-shell">
+      <div className="home-noise" aria-hidden="true" />
+
+      <header className="home-topbar">
+        <a href="/" className="brand" aria-label="VANTEX home">
+          <span className="brand-mark">
+            <Icon name="spark" size={23} />
+          </span>
+          <span className="brand-name">VANTEX</span>
+          <span className="brand-ai">AI</span>
+        </a>
+
+        <div className="connection-status">
+          <span className="status-dot" />
+          <span>LOCAL AGENT</span>
+        </div>
+      </header>
+
+      <section className="command-main">
+        <div className="hero-badge">
+          <span className="hero-badge-dot" />
+          YOUR PERSONAL AI WORKSPACE
+        </div>
+
+        <div className="hero-orb" aria-hidden="true">
+          <div className="orb-ring orb-ring-one" />
+          <div className="orb-ring orb-ring-two" />
+          <div className="orb-core">
+            <Icon name="spark" size={37} />
+          </div>
+          <div className="orb-glow" />
+        </div>
+
+        <h1 className="hero-title">
+          Your PC.
+          <br />
+          <span>Your commands.</span>
+        </h1>
+
+        <p className="hero-description">
+          Search files, open projects, test websites, and interact with your
+          system — all from one place.
+        </p>
+
+        <form className="command-form" onSubmit={handleSubmit}>
+          <div className="command-box">
+            <span className="command-search-icon">
+              <Icon name="search" size={22} />
+            </span>
+
+            <input
+              value={command}
+              onChange={(event) => setCommand(event.target.value)}
+              placeholder="Tell VANTEX what you want to do..."
+              aria-label="Enter a command"
+              autoComplete="off"
+              spellCheck={false}
+            />
+
+            <button
+              className="command-submit"
+              type="submit"
+              disabled={loading || !command.trim()}
+              aria-label="Run command"
+            >
+              {loading ? (
+                <span className="loading-spinner" />
+              ) : (
+                <>
+                  <span>Run</span>
+                  <span className="run-arrow">↗</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          <p className="command-hint">
+            <kbd>Enter</kbd> to run
+            <span className="hint-separator">·</span>
+            Your commands run through your local agent
+          </p>
+        </form>
+
+        <div className="quick-actions">
+          <span className="section-label">TRY A COMMAND</span>
+
+          <div className="quick-action-list">
+            <button
+              type="button"
+              className="quick-action"
+              onClick={() => setCommand('Find Home.tsx')}
+            >
+              <Icon name="file" size={17} />
+              <span>Find a file</span>
+              <span className="quick-action-arrow">↗</span>
+            </button>
+
+            <button
+              type="button"
+              className="quick-action"
+              onClick={() => setCommand('Test http://127.0.0.1:5173')}
+            >
+              <Icon name="check" size={17} />
+              <span>Test a website</span>
+              <span className="quick-action-arrow">↗</span>
+            </button>
+
+            <button
+              type="button"
+              className="quick-action"
+              onClick={() => onOpenIntelligence?.()}
+            >
+              <Icon name="monitor" size={17} />
+              <span>PC Intelligence</span>
+              <span className="quick-action-arrow">↗</span>
+            </button>
+          </div>
+        </div>
+
+        {history.length > 0 && !result && !error && (
+          <div className="recent-commands">
+            <span className="section-label">RECENT COMMANDS</span>
+            <div className="recent-command-list">
+              {history.map((item) => (
+                <button
+                  type="button"
+                  key={item}
+                  onClick={() => setCommand(item)}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {loading && (
+          <div className="working-indicator">
+            <span className="working-pulse" />
+            <span>VANTEX is working on your request…</span>
+          </div>
+        )}
+
+        {error && (
+          <section className="error-panel" role="alert">
+            <div className="error-symbol">!</div>
+            <div>
+              <h2>Something went wrong</h2>
+              <p>{error}</p>
+              <button
+                type="button"
+                className="retry-button"
+                onClick={() => {
+                  const previousCommand = command;
+                  setError('');
+
+                  if (previousCommand.trim()) {
+                    const form = document.querySelector<HTMLFormElement>(
+                      '.command-form',
+                    );
+                    form?.requestSubmit();
+                  }
+                }}
+              >
+                Try again
+              </button>
+            </div>
+          </section>
+        )}
+
+        {result && (
+          <ResultCard
+            title={result.title}
+            message={result.message}
+            onClear={clearResult}
+          >
+            {result.details && (
+              <div className="result-details">{result.details}</div>
+            )}
+
+            {result.title === 'Website test complete' && result.data != null && (
+              <WebsiteQAReport data={result.data} />
+            )}
+
+            {result.files && (
+              <FileResults
+                files={result.files}
+                onOpen={openFile}
+                openingPath={openingPath}
+              />
+            )}
+
+            {result.title === 'PC status' && systemEntries.length > 0 && (
+              <div className="system-result-grid">
+                {systemEntries.map(([key, value]) => (
+                  <div className="system-result-item" key={key}>
+                    <span>{key.replaceAll('_', ' ')}</span>
+                    <strong>{String(value)}</strong>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {result.title === 'Website test complete' &&
+              systemEntries.length > 0 && (
+                <div className="system-result-grid">
+                  {systemEntries
+                    .filter(([key]) =>
+                      ['title', 'http_status', 'success', 'url'].includes(
+                        key.toLowerCase(),
+                      ),
+                    )
+                    .map(([key, value]) => (
+                      <div className="system-result-item" key={key}>
+                        <span>{key.replaceAll('_', ' ')}</span>
+                        <strong>{String(value)}</strong>
+                      </div>
+                    ))}
+                </div>
+              )}
+
+            {result.data != null &&
+              !result.files &&
+              systemEntries.length === 0 && (
+                <details className="technical-details">
+                  <summary>Technical details</summary>
+                  <pre>{JSON.stringify(result.data, null, 2)}</pre>
+                </details>
+              )}
+          </ResultCard>
+        )}
+      </section>
+
+
+      <footer className="home-footer">
+        <div className="footer-line" />
+        <span>VANTEX AI</span>
+        <span className="footer-separator">/</span>
+        <span>LOCAL-FIRST INTELLIGENCE</span>
+        <span className="footer-right">
+          BUILT FOR YOUR WORKFLOW
+        </span>
+      </footer>
+    </main>
+  );
+}

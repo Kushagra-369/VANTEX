@@ -295,7 +295,7 @@ function detectIntent(input: string) {
       query: text,
     };
   }
- 
+
 
   // Filename / folder search
   const isFileSearch =
@@ -447,6 +447,260 @@ function Icon({
   };
 
   return <svg {...common}>{paths[name]}</svg>;
+}
+
+
+type ResponsiveCheck = {
+  name: string;
+  width: number;
+  height: number;
+  passed: boolean;
+  horizontal_overflow: boolean;
+  viewport_width: number;
+  document_width: number;
+  overflowing_elements: {
+    element: string;
+    left: number;
+    right: number;
+    width: number;
+  }[];
+};
+
+function WebsiteQAReport({ data }: { data: unknown }) {
+  const report = asObject(data);
+  if (!report) return null;
+
+  const summary = asObject(report.summary);
+
+  const count = (key: string) =>
+    typeof summary?.[key] === 'number' ? summary[key] as number : 0;
+
+  const checks = Array.isArray(report.responsive_checks)
+    ? report.responsive_checks.filter((item) => {
+        const check = asObject(item);
+        return check !== null &&
+          typeof check.name === 'string' &&
+          typeof check.passed === 'boolean';
+      }) as ResponsiveCheck[]
+    : [];
+
+  const pages = Array.isArray(report.pages)
+    ? report.pages.map(asObject).filter(
+        (page): page is Record<string, unknown> => page !== null,
+      )
+    : [];
+
+  const externalLinks = Array.isArray(report.external_links)
+    ? report.external_links.map(asObject).filter(
+        (item): item is Record<string, unknown> => item !== null,
+      )
+    : [];
+
+  const success = report.success === true;
+  const metrics = [
+    { label: 'Pages tested', value: count('pages_tested') },
+    { label: 'Pages failed', value: count('pages_failed') },
+    { label: 'Console errors', value: count('console_error_count') },
+    { label: 'JavaScript errors', value: count('page_error_count') },
+    { label: 'Failed requests', value: count('failed_request_count') },
+    {
+      label: 'Broken external links',
+      value: count('external_broken_link_count'),
+    },
+  ];
+
+  function renderResponsive(items: unknown) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return <p className="qa-no-results">No responsive results available.</p>;
+    }
+
+    return (
+      <div className="qa-viewport-grid">
+        {items.map((item, index) => {
+          const check = asObject(item);
+          if (!check) return null;
+
+          const name = typeof check.name === 'string' ? check.name : 'Viewport';
+          const passed = check.passed === true;
+
+          return (
+            <article className="qa-viewport" key={`${name}-${index}`}>
+              <div className="qa-viewport-top">
+                <span className="qa-device-icon">
+                  {name === 'mobile' ? '▯' : name === 'tablet' ? '▤' : '▭'}
+                </span>
+                <span className={`qa-mini-status ${passed ? 'is-pass' : 'is-fail'}`}>
+                  {passed ? 'PASS' : 'FAIL'}
+                </span>
+              </div>
+              <h4>{name.charAt(0).toUpperCase() + name.slice(1)}</h4>
+              <p>{String(check.width ?? '?')} × {String(check.height ?? '?')}</p>
+              <div className="qa-width-detail">
+                <span>Viewport width</span>
+                <strong>{String(check.viewport_width ?? '?')}px</strong>
+              </div>
+              <div className="qa-width-detail">
+                <span>Document width</span>
+                <strong>{String(check.document_width ?? '?')}px</strong>
+              </div>
+              {check.horizontal_overflow === true && (
+                <details className="qa-overflow-details">
+                  <summary>View overflowing elements</summary>
+                  <pre>{JSON.stringify(check.overflowing_elements ?? [], null, 2)}</pre>
+                </details>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <section className="qa-report" aria-label="Website QA report">
+      <div className="qa-report-heading">
+        <div>
+          <span className="qa-eyebrow">AUTOMATED WEBSITE AUDIT</span>
+          <h3>Test overview</h3>
+          <p>{String(report.tested_url ?? '')}</p>
+        </div>
+        <span className={`qa-status ${success ? 'is-pass' : 'is-fail'}`}>
+          <span className="qa-status-dot" />
+          {success ? 'TEST COMPLETED' : 'CHECK RESULTS'}
+        </span>
+      </div>
+
+      <div className="qa-metrics">
+        {metrics.map((metric) => (
+          <article className="qa-metric" key={metric.label}>
+            <span>{metric.label}</span>
+            <strong className={metric.value > 0 && metric.label !== 'Pages tested'
+              ? 'has-issues' : ''}>
+              {metric.value}
+            </strong>
+          </article>
+        ))}
+      </div>
+
+      {pages.length > 0 ? (
+        <div className="qa-responsive">
+          <div className="qa-section-heading">
+            <div>
+              <h3>Pages tested</h3>
+              <p>
+                {pages.length} page(s) tested · Maximum crawl limit: {String(report.crawl_limit ?? 50)}
+              </p>
+            </div>
+          </div>
+
+          <div className="qa-page-list">
+            {pages.map((page, index) => {
+              const pageSummary = asObject(page.summary);
+              const status = typeof page.http_status === 'number'
+                ? page.http_status : null;
+              const pageSuccess = page.success === true;
+              const pageChecks = Array.isArray(page.responsive_checks)
+                ? page.responsive_checks : [];
+
+              return (
+                <details className="qa-page-item" key={`${String(page.url ?? index)}-${index}`}>
+                  <summary className="qa-page-summary">
+                    <span className={`qa-mini-status ${pageSuccess ? 'is-pass' : 'is-fail'}`}>
+                      {status ?? 'ERR'}
+                    </span>
+                    <span className="qa-page-title">
+                      <strong>{String(page.title || page.url || `Page ${index + 1}`)}</strong>
+                      <small>{String(page.url ?? '')}</small>
+                    </span>
+                    <span className={`qa-status ${pageSuccess ? 'is-pass' : 'is-fail'}`}>
+                      {pageSuccess ? 'PASS' : 'ISSUES'}
+                    </span>
+                  </summary>
+
+                  {typeof page.navigation_error === 'string' && (
+                    <p className="qa-no-results">{page.navigation_error}</p>
+                  )}
+                  {typeof page.page_test_error === 'string' && (
+                    <p className="qa-no-results">{page.page_test_error}</p>
+                  )}
+
+                  <div className="qa-metrics">
+                    {[
+                      ['Console errors', pageSummary?.console_error_count],
+                      ['JS errors', pageSummary?.page_error_count],
+                      ['Failed requests', pageSummary?.failed_request_count],
+                      ['Responsive failures', pageSummary?.responsive_viewports_failed],
+                    ].map(([label, value]) => (
+                      <article className="qa-metric" key={String(label)}>
+                        <span>{String(label)}</span>
+                        <strong>{typeof value === 'number' ? value : 0}</strong>
+                      </article>
+                    ))}
+                  </div>
+
+                  <h4>Responsive checks</h4>
+                  {renderResponsive(pageChecks)}
+
+                  {[
+                    ['Console errors', page.console_errors],
+                    ['JavaScript errors', page.page_errors],
+                    ['Failed requests', page.failed_requests],
+                  ].map(([label, value]) => (
+                    Array.isArray(value) && value.length > 0 ? (
+                      <details className="technical-details" key={String(label)}>
+                        <summary>{String(label)} ({value.length})</summary>
+                        <pre>{JSON.stringify(value, null, 2)}</pre>
+                      </details>
+                    ) : null
+                  ))}
+                </details>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="qa-responsive">
+          <div className="qa-section-heading">
+            <div>
+              <h3>Responsive checks</h3>
+              <p>Horizontal overflow detection</p>
+            </div>
+            <span className="qa-status is-neutral">
+              {checks.length > 0
+                ? `${checks.filter((check) => check.passed).length}/${checks.length} PASSED`
+                : 'NOT AVAILABLE'}
+            </span>
+          </div>
+          {renderResponsive(checks)}
+        </div>
+      )}
+
+      {externalLinks.length > 0 && (
+        <details className="technical-details">
+          <summary>External links checked ({externalLinks.length})</summary>
+          <ul>
+            {externalLinks.map((item, index) => {
+              const broken = item.broken === true;
+              return (
+                <li key={`${String(item.url ?? index)}-${index}`}>
+                  <span className={`qa-mini-status ${broken ? 'is-fail' : 'is-pass'}`}>
+                    {broken ? 'FAIL' : String(item.status ?? 'OK')}
+                  </span>{' '}
+                  <code>{String(item.url ?? '')}</code>
+                  {typeof item.error === 'string' && ` — ${item.error}`}
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      )}
+
+      <details className="technical-details qa-raw-details">
+        <summary>Full QA response</summary>
+        <pre>{JSON.stringify(data, null, 2)}</pre>
+      </details>
+    </section>
+  );
 }
 
 function ResultCard({
@@ -1043,6 +1297,10 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
           >
             {result.details && (
               <div className="result-details">{result.details}</div>
+            )}
+
+            {result.title === 'Website test complete' && result.data != null && (
+              <WebsiteQAReport data={result.data} />
             )}
 
             {result.files && (

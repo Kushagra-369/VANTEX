@@ -1,0 +1,2022 @@
+from urllib.parse import urljoin, urlparse
+import psutil
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from pathlib import Path
+from fastapi import Query
+import difflib
+import hashlib
+import secrets
+from datetime import datetime, timezone
+app = FastAPI(
+    title="VANTEX API",
+    description="VANTEX Website QA Engine",
+    version="0.2.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+class WebsiteTestRequest(BaseModel):
+    url: HttpUrl
+
+
+@app.get("/")
+def home():
+    return {
+        "name": "VANTEX",
+        "message": "Backend is running",
+        "version": "0.2.0",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "vantex-api"}
+
+@app.get("/api/agent/system")
+def get_system_status():
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+
+    return {
+        "agent": "VANTEX Local Agent",
+        "connected": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "system": {
+            "cpu_percent": psutil.cpu_percent(interval=0.5),
+            "ram_percent": memory.percent,
+            "ram_total_gb": round(memory.total / (1024 ** 3), 2),
+            "ram_available_gb": round(memory.available / (1024 ** 3), 2),
+            "disk_percent": disk.percent,
+            "disk_free_gb": round(disk.free / (1024 ** 3), 2),
+        },
+    }
+
+
+@app.post("/api/qa/test")
+async def test_website(request: WebsiteTestRequest):
+    from collections import deque
+    from urllib.parse import urldefrag, urlunparse
+    import xml.etree.ElementTree as ET
+    import re
+
+    start_url = str(request.url)
+    parsed_start = urlparse(start_url)
+
+    if parsed_start.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only HTTP and HTTPS URLs are supported."
+        )
+
+    def normalize_url(raw_url):
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        parsed = parsed._replace(fragment="")
+        return urlunparse(parsed)
+
+    def same_origin(first, second):
+        a, b = urlparse(first), urlparse(second)
+        return (
+            a.scheme.lower() == b.scheme.lower()
+            and (a.hostname or "").lower() == (b.hostname or "").lower()
+            and (a.port or (443 if a.scheme == "https" else 80))
+            == (b.port or (443 if b.scheme == "https" else 80))
+        )
+
+    start_url = normalize_url(start_url)
+    queue = deque([(start_url, 0)])
+    queued = {start_url}
+    visited = set()
+    pages = []
+    external_links = {}
+    max_pages = 50
+    max_depth = 5
+    max_links_per_page = 100
+    max_external_checks = 50
+
+    discovered_urls = {start_url}
+
+    async def discover_sitemap_urls(request_context, base_url):
+        """Discover same-origin URLs through robots.txt and XML sitemaps."""
+        origin = urlparse(base_url)
+        robots_url = f"{origin.scheme}://{origin.netloc}/robots.txt"
+        sitemap_queue = []
+        found_pages = set()
+
+        try:
+            response = await request_context.get(
+                robots_url, timeout=7000, fail_on_status_code=False
+            )
+            if response.status < 400:
+                robots_text = await response.text()
+                for line in robots_text.splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key.strip().lower() == "sitemap":
+                        candidate = normalize_url(value.strip())
+                        if candidate and same_origin(base_url, candidate):
+                            sitemap_queue.append(candidate)
+        except Exception:
+            pass
+
+        # Standard fallback for sites that do not declare a sitemap in robots.txt.
+        fallback = normalize_url(urljoin(base_url, "/sitemap.xml"))
+        if fallback and fallback not in sitemap_queue:
+            sitemap_queue.append(fallback)
+
+        seen_sitemaps = set()
+        max_sitemaps = 10
+
+        while sitemap_queue and len(seen_sitemaps) < max_sitemaps:
+            sitemap_url = sitemap_queue.pop(0)
+            if sitemap_url in seen_sitemaps:
+                continue
+            seen_sitemaps.add(sitemap_url)
+
+            try:
+                response = await request_context.get(
+                    sitemap_url, timeout=7000, fail_on_status_code=False
+                )
+                if response.status >= 400:
+                    continue
+
+                body = await response.text()
+                if len(body) > 5_000_000:
+                    continue
+
+                root = ET.fromstring(body)
+                for element in root.iter():
+                    if element.tag.rsplit("}", 1)[-1].lower() != "loc":
+                        continue
+
+                    value = (element.text or "").strip()
+                    candidate = normalize_url(urljoin(sitemap_url, value))
+                    if not candidate or not same_origin(base_url, candidate):
+                        continue
+
+                    # Sitemap indexes contain sitemap URLs; ordinary sitemaps
+                    # contain page URLs. Both are handled without fixed routes.
+                    if candidate.lower().endswith(".xml"):
+                        if candidate not in seen_sitemaps:
+                            sitemap_queue.append(candidate)
+                    else:
+                        found_pages.add(candidate)
+
+                    if len(found_pages) >= 2000:
+                        return found_pages
+            except Exception:
+                continue
+
+        return found_pages
+
+    async def discover_bundle_routes(page, request_context, base_url):
+        """Extract static, absolute SPA route candidates from same-origin JS."""
+        route_candidates = set()
+
+        try:
+            script_urls = await page.locator("script[src]").evaluate_all(
+                "els => els.map(el => el.src).filter(Boolean)"
+            )
+        except Exception:
+            return route_candidates
+
+        # Avoid fetching arbitrary third-party scripts or unlimited assets.
+        same_origin_scripts = []
+        for script_url in script_urls:
+            normalized = normalize_url(script_url)
+            if normalized and same_origin(base_url, normalized):
+                if normalized not in same_origin_scripts:
+                    same_origin_scripts.append(normalized)
+
+        # Bound the work performed on any one page.
+        for script_url in same_origin_scripts[:10]:
+            try:
+                response = await request_context.get(
+                    script_url, timeout=7000, fail_on_status_code=False
+                )
+                if response.status >= 400:
+                    continue
+
+                content_length = response.headers.get("content-length", "")
+                if content_length.isdigit() and int(content_length) > 5_000_000:
+                    continue
+
+                bundle_text = await response.text()
+                if len(bundle_text) > 5_000_000:
+                    continue
+
+                patterns = (
+                    r'path\s*:\s*`([^`]+)`',
+                    r'path\s*:\s*"([^"]+)"',
+                    r"path\s*:\s*'([^']+)'",
+                )
+
+                for pattern in patterns:
+                    for match in re.finditer(pattern, bundle_text):
+                        route = match.group(1).strip()
+
+                        # Only static absolute paths are safe crawl candidates.
+                        if (
+                            not route.startswith("/")
+                            or route.startswith("//")
+                            or len(route) > 150
+                            or any(char in route for char in (" ", "\n", "<", ">"))
+                            or any(char in route for char in (":", "*", "{", "}"))
+                        ):
+                            continue
+
+                        candidate = normalize_url(urljoin(base_url, route))
+                        if candidate and same_origin(base_url, candidate):
+                            route_candidates.add(candidate)
+
+            except Exception:
+                continue
+
+        return route_candidates
+
+    browser = None
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(ignore_https_errors=False)
+
+            sitemap_urls = await discover_sitemap_urls(
+                context.request, start_url
+            )
+            discovered_urls.update(sitemap_urls)
+
+            for sitemap_url in sorted(sitemap_urls):
+                if len(queued) >= max_pages:
+                    break
+                if sitemap_url not in queued:
+                    queued.add(sitemap_url)
+                    queue.append((sitemap_url, 1))
+
+            while queue and len(visited) < max_pages:
+                current_url, depth = queue.popleft()
+
+                if current_url in visited:
+                    continue
+
+                visited.add(current_url)
+                page_result = {
+                    "url": current_url,
+                    "depth": depth,
+                    "title": None,
+                    "final_url": None,
+                    "http_status": None,
+                    "success": False,
+                    "console_errors": [],
+                    "page_errors": [],
+                    "failed_requests": [],
+                    "broken_links": [],
+                    "links_checked": 0,
+                    "responsive_checks": [],
+                    "summary": {},
+                }
+
+                page = await context.new_page()
+                page.set_default_timeout(10000)
+
+                page.on(
+                    "console",
+                    lambda message, result=page_result:
+                        result["console_errors"].append(message.text)
+                        if message.type == "error"
+                        and len(result["console_errors"]) < 30 else None
+                )
+                page.on(
+                    "pageerror",
+                    lambda error, result=page_result:
+                        result["page_errors"].append(str(error)[:300])
+                        if len(result["page_errors"]) < 30 else None
+                )
+                page.on(
+                    "requestfailed",
+                    lambda req, result=page_result:
+                        result["failed_requests"].append({
+                            "url": req.url,
+                            "error": req.failure,
+                        })
+                        if len(result["failed_requests"]) < 30 else None
+                )
+
+                discovered_internal = set()
+
+                try:
+                    try:
+                        response = await page.goto(
+                            current_url,
+                            wait_until="domcontentloaded",
+                            timeout=20000,
+                        )
+                    except PlaywrightTimeoutError:
+                        page_result["navigation_error"] = "Navigation timed out."
+                        response = None
+                    except Exception as error:
+                        page_result["navigation_error"] = str(error)[:300]
+                        response = None
+
+                    page_result["final_url"] = page.url
+                    page_result["title"] = await page.title()
+                    page_result["http_status"] = (
+                        response.status if response else None
+                    )
+                    page_result["success"] = bool(
+                        response and response.status < 400
+                    )
+
+                    # Discover links on this page. Only same-origin links enter
+                    # the crawl queue; external links are checked separately.
+                    raw_links = await page.locator("a[href]").evaluate_all(
+                        """els => els.map(a => a.href).filter(Boolean)"""
+                    )
+
+                    for raw_link in raw_links[:max_links_per_page]:
+                        normalized = normalize_url(raw_link)
+                        if not normalized:
+                            continue
+
+                        if same_origin(start_url, normalized):
+                            discovered_urls.add(normalized)
+                            if normalized not in visited:
+                                discovered_internal.add(normalized)
+                        else:
+                            external_links.setdefault(normalized, None)
+
+                    page_result["links_checked"] = min(
+                        len(raw_links), max_links_per_page
+                    )
+
+                    # Discover static SPA route candidates from same-origin bundles.
+                    # These are candidates, not proof that a page is accessible.
+                    bundle_routes = await discover_bundle_routes(
+                        page, context.request, start_url
+                    )
+                    discovered_urls.update(bundle_routes)
+                    discovered_internal.update(bundle_routes)
+
+                    # Responsive horizontal-overflow checks.
+                    viewports = [
+                        {"name": "desktop", "width": 1440, "height": 900},
+                        {"name": "tablet", "width": 768, "height": 1024},
+                        {"name": "mobile", "width": 390, "height": 844},
+                    ]
+
+                    for viewport in viewports:
+                        await page.set_viewport_size({
+                            "width": viewport["width"],
+                            "height": viewport["height"],
+                        })
+                        await page.wait_for_timeout(150)
+
+                        layout = await page.evaluate("""() => {
+                            const viewportWidth =
+                                document.documentElement.clientWidth;
+                            const documentWidth = Math.max(
+                                document.documentElement.scrollWidth,
+                                document.body ? document.body.scrollWidth : 0
+                            );
+                            const overflowing = [];
+
+                            for (const element of document.querySelectorAll("body *")) {
+                                if (overflowing.length >= 20) break;
+                                const rect = element.getBoundingClientRect();
+                                const style = getComputedStyle(element);
+
+                                if (
+                                    rect.width > 0 &&
+                                    rect.height > 0 &&
+                                    style.position !== "fixed" &&
+                                    (rect.left < -1 ||
+                                     rect.right > viewportWidth + 1)
+                                ) {
+                                    overflowing.push({
+                                        element: (
+                                            element.tagName.toLowerCase() +
+                                            (element.id ? "#" + element.id : "")
+                                        ).slice(0, 160),
+                                        left: Math.round(rect.left),
+                                        right: Math.round(rect.right),
+                                        width: Math.round(rect.width)
+                                    });
+                                }
+                            }
+
+                            return {
+                                viewport_width: viewportWidth,
+                                document_width: documentWidth,
+                                horizontal_overflow:
+                                    documentWidth > viewportWidth + 1,
+                                overflowing_elements: overflowing
+                            };
+                        }""")
+
+                        page_result["responsive_checks"].append({
+                            **viewport,
+                            **layout,
+                            "passed": not layout["horizontal_overflow"],
+                        })
+
+                except Exception as error:
+                    page_result["page_test_error"] = str(error)[:300]
+                finally:
+                    await page.close()
+
+                page_result["summary"] = {
+                    "console_error_count": len(page_result["console_errors"]),
+                    "page_error_count": len(page_result["page_errors"]),
+                    "failed_request_count": len(page_result["failed_requests"]),
+                    "responsive_viewports_tested":
+                        len(page_result["responsive_checks"]),
+                    "responsive_viewports_failed": sum(
+                        1 for item in page_result["responsive_checks"]
+                        if not item["passed"]
+                    ),
+                }
+                pages.append(page_result)
+
+                if depth < max_depth:
+                    for discovered_url in sorted(discovered_internal):
+                        if discovered_url not in queued and len(queued) < max_pages:
+                            queued.add(discovered_url)
+                            queue.append((discovered_url, depth + 1))
+
+            await browser.close()
+            browser = None
+
+        # Check a bounded number of external links separately. Never crawl
+        # their pages or execute their JavaScript.
+        external_results = []
+        async with async_playwright() as playwright:
+            request_context = await playwright.request.new_context(
+                timeout=7000,
+                ignore_https_errors=False,
+            )
+            for external_url in list(external_links.keys())[:max_external_checks]:
+                result = {"url": external_url, "status": None, "error": None}
+                try:
+                    response = await request_context.get(
+                        external_url,
+                        fail_on_status_code=False,
+                    )
+                    result["status"] = response.status
+                    result["broken"] = response.status >= 400
+                except Exception as error:
+                    result["error"] = str(error)[:180]
+                    result["broken"] = True
+                external_results.append(result)
+            await request_context.dispose()
+
+        total_console_errors = sum(len(p["console_errors"]) for p in pages)
+        total_page_errors = sum(len(p["page_errors"]) for p in pages)
+        total_failed_requests = sum(len(p["failed_requests"]) for p in pages)
+        total_responsive_failed = sum(
+            item["summary"].get("responsive_viewports_failed", 0)
+            for item in pages
+        )
+        failed_pages = sum(1 for p in pages if not p["success"])
+
+        # Keep legacy fields for the existing frontend, and provide the
+        # detailed per-page report alongside them.
+        first = pages[0] if pages else {}
+        return {
+            "success": bool(pages) and not failed_pages,
+            "tested_url": start_url,
+            "final_url": first.get("final_url"),
+            "title": first.get("title"),
+            "http_status": first.get("http_status"),
+            "console_errors": first.get("console_errors", []),
+            "page_errors": first.get("page_errors", []),
+            "failed_requests": first.get("failed_requests", []),
+            "broken_links": external_results,
+            "links_checked": sum(p["links_checked"] for p in pages),
+            "responsive_checks": first.get("responsive_checks", []),
+            "pages": pages,
+            "external_links": external_results,
+            "pages_discovered": len(discovered_urls),
+            "pages_tested": len(pages),
+            "pages_failed": failed_pages,
+            "crawl_limit": max_pages,
+            "summary": {
+                "pages_tested": len(pages),
+                "pages_failed": failed_pages,
+                "console_error_count": total_console_errors,
+                "page_error_count": total_page_errors,
+                "failed_request_count": total_failed_requests,
+                "external_links_checked": len(external_results),
+                "external_broken_link_count": sum(
+                    1 for item in external_results if item.get("broken")
+                ),
+                "responsive_viewports_tested": sum(
+                    len(p["responsive_checks"]) for p in pages
+                ),
+                "responsive_viewports_failed": total_responsive_failed,
+            },
+            "note": (
+                "Pages are discovered from rendered same-origin links and "
+                "robots.txt/XML sitemaps. Crawl limits are currently 50 pages "
+                "and depth 5; up to 50 external links are checked separately. "
+                "Hidden routes, login-protected pages and button-only navigation "
+                "may require additional discovery or an authorized login session. "
+                "Responsive checks detect horizontal overflow, not every visual defect."
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Website test failed: {str(error)[:250]}",
+        ) from error
+
+# VANTEX Local File Access — initial restricted version
+
+
+# VANTEX Local File Access — initial restricted version
+
+import os
+
+AGENT_ROOT = (Path.home() / "Desktop" / "VANTEX").resolve()
+MAX_READ_BYTES = 1_000_000
+SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", "dist", "build"}
+
+
+def resolve_agent_path(raw_path: str | None = None) -> Path:
+    """Allow access only inside the configured VANTEX project directory."""
+    candidate = Path(raw_path).expanduser() if raw_path else AGENT_ROOT
+
+    if not candidate.is_absolute():
+        candidate = AGENT_ROOT / candidate
+
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(AGENT_ROOT)
+    except (ValueError, OSError, RuntimeError):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path is outside the approved VANTEX folder or does not exist.",
+        )
+
+    return resolved
+
+
+@app.get("/api/agent/files/list")
+def list_agent_files(path: str | None = Query(default=None)):
+    directory = resolve_agent_path(path)
+
+    if not directory.is_dir():
+        raise HTTPException(status_code=400, detail="Path is not a directory.")
+
+    entries = []
+
+    try:
+        for item in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
+            try:
+                resolved_item = item.resolve(strict=True)
+                resolved_item.relative_to(AGENT_ROOT)
+                is_dir = resolved_item.is_dir()
+
+                entries.append({
+                    "name": item.name,
+                    "type": "directory" if is_dir else "file",
+                    "path": str(resolved_item),
+                    "size_bytes": None if is_dir else resolved_item.stat().st_size,
+                })
+            except (OSError, ValueError, RuntimeError):
+                continue
+
+            if len(entries) >= 200:
+                break
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Permission denied.")
+
+    return {
+        "root": str(AGENT_ROOT),
+        "directory": str(directory),
+        "entries": entries,
+        "count": len(entries),
+    }
+
+
+@app.get("/api/agent/files/search")
+def search_agent_files(
+    query: str = Query(min_length=1, max_length=200),
+):
+    needle = query.casefold()
+    matches = []
+    scanned = 0
+    scan_limit = 10000
+
+    for current, dirs, files in os.walk(AGENT_ROOT, followlinks=False):
+        dirs[:] = [
+            name for name in dirs
+            if name not in SKIP_DIRS
+            and not (Path(current) / name).is_symlink()
+        ]
+
+        for name in files:
+            scanned += 1
+
+            if needle in name.casefold():
+                candidate = Path(current) / name
+
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(AGENT_ROOT)
+
+                    matches.append({
+                        "name": name,
+                        "path": str(resolved),
+                    })
+                except (OSError, ValueError, RuntimeError):
+                    continue
+
+                if len(matches) >= 100:
+                    return {
+                        "query": query,
+                        "matches": matches,
+                        "truncated": True,
+                    }
+
+            if scanned >= scan_limit:
+                return {
+                    "query": query,
+                    "matches": matches,
+                    "truncated": True,
+                    "message": "Scan limit reached.",
+                }
+
+    return {
+        "query": query,
+        "matches": matches,
+        "truncated": False,
+    }
+
+
+@app.get("/api/agent/files/read")
+def read_agent_file(path: str = Query(min_length=1)):
+    file_path = resolve_agent_path(path)
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=400, detail="Path is not a file.")
+
+    if file_path.stat().st_size > MAX_READ_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds the 1 MB read limit.",
+        )
+
+    try:
+        content = file_path.read_bytes()
+
+        if b"\x00" in content:
+            raise HTTPException(
+                status_code=415,
+                detail="Binary files are not supported by this text reader.",
+            )
+
+        text_content = content.decode("utf-8")
+
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=415,
+            detail="File is not valid UTF-8 text.",
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Permission denied.")
+
+    return {
+        "path": str(file_path),
+        "size_bytes": len(content),
+        "content": text_content,
+        "read_only": True,
+    }
+
+# VANTEX controlled file editing
+
+from pydantic import Field
+
+
+class PrepareEditRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    new_content: str = Field(max_length=1_000_000)
+
+
+class ApplyEditRequest(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=100)
+    approve: bool = False
+
+
+# Prototype storage: pending proposals remain in memory until API restarts.
+PENDING_EDITS = {}
+
+
+@app.post("/api/agent/files/prepare-edit")
+def prepare_file_edit(request: PrepareEditRequest):
+    target = resolve_agent_path(request.path)
+
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Target must be an existing file.")
+
+    if target.is_symlink():
+        raise HTTPException(status_code=403, detail="Symbolic links cannot be edited.")
+
+    if target.stat().st_size > MAX_READ_BYTES:
+        raise HTTPException(status_code=413, detail="Original file exceeds 1 MB.")
+
+    try:
+        original_content = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, PermissionError):
+        raise HTTPException(
+            status_code=415,
+            detail="Only readable UTF-8 text files can be edited.",
+        )
+
+    if "\x00" in original_content or "\x00" in request.new_content:
+        raise HTTPException(status_code=415, detail="Binary content is not supported.")
+
+    if original_content == request.new_content:
+        return {"changed": False, "message": "File already has this content."}
+
+    proposal_id = secrets.token_urlsafe(24)
+    original_hash = hashlib.sha256(
+        original_content.encode("utf-8")
+    ).hexdigest()
+
+    diff = list(difflib.unified_diff(
+        original_content.splitlines(),
+        request.new_content.splitlines(),
+        fromfile=f"original/{target.name}",
+        tofile=f"proposed/{target.name}",
+        lineterm="",
+    ))
+
+    PENDING_EDITS[proposal_id] = {
+        "path": str(target),
+        "original_hash": original_hash,
+        "new_content": request.new_content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return {
+        "proposal_id": proposal_id,
+        "path": str(target),
+        "changed": True,
+        "diff": diff,
+        "approval_required": True,
+        "message": "Review the diff. The original file has not been changed.",
+    }
+
+
+@app.post("/api/agent/files/apply-edit")
+def apply_file_edit(request: ApplyEditRequest):
+    if not request.approve:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit approval is required to apply this edit.",
+        )
+
+    proposal = PENDING_EDITS.get(request.proposal_id)
+    if not proposal:
+        raise HTTPException(
+            status_code=404,
+            detail="Proposal not found or expired after a server restart.",
+        )
+
+    target = resolve_agent_path(proposal["path"])
+
+    if not target.is_file() or target.is_symlink():
+        raise HTTPException(status_code=403, detail="Target is no longer a regular file.")
+
+    current_content = target.read_text(encoding="utf-8")
+    current_hash = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
+
+    if current_hash != proposal["original_hash"]:
+        PENDING_EDITS.pop(request.proposal_id, None)
+        raise HTTPException(
+            status_code=409,
+            detail="File changed after proposal creation. Prepare a fresh edit.",
+        )
+
+    new_content = proposal["new_content"]
+    backup_dir = AGENT_ROOT / ".vantex_backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_path = backup_dir / f"{target.name}.{timestamp}.bak"
+    backup_path.write_text(current_content, encoding="utf-8")
+
+    temp_path = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+
+    try:
+        temp_path.write_text(new_content, encoding="utf-8")
+        os.replace(temp_path, target)
+
+        verified_content = target.read_text(encoding="utf-8")
+        if verified_content != new_content:
+            raise OSError("Post-write verification failed.")
+
+    except Exception as error:
+        try:
+            if backup_path.exists():
+                os.replace(backup_path, target)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"Edit failed or verification failed: {str(error)[:200]}",
+        ) from error
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    PENDING_EDITS.pop(request.proposal_id, None)
+
+    return {
+        "success": True,
+        "path": str(target),
+        "verified": True,
+        "backup_path": str(backup_path),
+        "message": "Approved edit applied and verified.",
+    }
+
+import re
+from pydantic import Field
+
+
+class AgentCommandRequest(BaseModel):
+    command: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/api/agent/command")
+async def run_agent_command(request: AgentCommandRequest):
+    command = request.command.strip()
+    lowered = command.casefold()
+
+    # Natural-language PC file commands
+    open_words = ("open", "open file", "kholo", "khol", "khul")
+
+    # Latest screenshot: show its location or open it.
+    if (
+        ("screenshot" in lowered or "screen shot" in lowered or " ss " in f" {lowered} ")
+        and any(word in lowered for word in ("latest", "last", "newest", "recent", "sabse nayi", "latest wali"))
+    ):
+        screenshot = latest_pc_screenshot()
+
+        if any(word in lowered for word in ("open", "kholo", "khol", "khul")):
+            opened = open_pc_file(OpenPcFileRequest(path=screenshot["path"]))
+            return {
+                "command": command,
+                "action": "open_latest_screenshot",
+                "result": opened,
+            }
+
+        return {
+            "command": command,
+            "action": "latest_screenshot",
+            "result": screenshot,
+        }
+
+    # Hindi/English file search, optionally restricted to one approved folder.
+    folder_names = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+
+    detected_folder = next(
+        (value for key, value in folder_names.items()
+         if re.search(rf"\b{key}\b", lowered)),
+        None,
+    )
+
+    folder_search = re.search(
+        r"(.+?)\s+(?:mein|me|par|pe)\s+(.+?)\s+(?:wali|waali)\s+files?\s+(?:de|dikha|dikhao|bata|batao|show)",
+        lowered,
+    )
+
+    if folder_search:
+        folder_from_command = folder_names.get(folder_search.group(1).strip())
+        if folder_from_command:
+            detected_folder = folder_from_command
+            query = folder_search.group(2).strip()
+            result = search_pc_files(query, folder=detected_folder)
+            return {
+                "command": command,
+                "action": "search_pc_files",
+                "result": result,
+            }
+
+    hindi_search = re.fullmatch(
+        r"(.+?)\s+(?:wali|waali)\s+(?:(?:saari|sari)\s+)?files?\s+(?:de|dikha|dikhao|bata|batao|show)",
+        lowered,
+    )
+
+    english_search = re.fullmatch(
+        r"(?:find|search|show|list)\s+(?:all\s+)?(?:pc\s+)?files?\s+(?:named|matching|for|about)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if hindi_search or english_search:
+        query = (
+            hindi_search.group(1).strip()
+            if hindi_search
+            else english_search.group(1).strip()
+        )
+        result = search_pc_files(query, folder=detected_folder)
+        return {
+            "command": command,
+            "action": "search_pc_files",
+            "result": result,
+        }
+
+
+
+
+    # General PC content search: documents, source code and configuration files.
+    content_extensions = {
+        ".pdf", ".docx", ".txt", ".md", ".rst", ".csv", ".log",
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".yaml",
+        ".yml", ".html", ".css", ".xml", ".sql", ".sh", ".toml",
+        ".ini", ".cfg", ".conf",
+    }
+
+   
+    ranking_occurrences = any(term in lowered for term in (
+        "sabse zyada baar", "sabse jyada baar",
+        "most occurrences", "most times", "appears most",
+        "mentioned most", "highest occurrence count",
+    ))
+
+    ranking_most = ranking_occurrences or any(term in lowered for term in (
+        "sabse zyada content", "most content", "maximum content",
+        "longest resume", "sabse detailed", "most words",
+        "most text", "longest document",
+    ))
+
+    ranking_least = any(term in lowered for term in (
+        "sabse kam content", "least content", "least words",
+        "shortest resume", "minimum content", "kam content",
+        "least text", "shortest document",
+    ))
+
+    ranking_largest = any(term in lowered for term in (
+        "sabse badi file", "largest file", "biggest file",
+        "sabse badi pdf", "largest pdf",
+    ))
+
+        # Generic content search: search terms are taken from the user's command.
+    content_search_patterns = [
+        re.compile(
+            r"^\s*(?:please\s+)?(?:search|find|look\s+for)\s+"
+            r"(?:all\s+)?files?\s+"
+            r"(?:with|containing|that\s+contain|mentioning)\s+(.+?)\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:please\s+)?(?:search|find|look\s+for)\s+"
+            r"(.+?)\s+files?\s+for\s+(.+?)\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:please\s+)?(?:search|find|look\s+for)\s+"
+            r"(resume|cv)\s+for\s+(.+?)\s*$",
+            re.IGNORECASE,
+        ),
+    ]
+
+    content_intent = (
+        ranking_most or ranking_least or ranking_largest
+    )
+    query = None
+    category_filter = None
+
+    for pattern in content_search_patterns:
+        match = pattern.match(command)
+        if not match:
+            continue
+
+        content_intent = True
+
+        if len(match.groups()) == 2:
+            category_filter = match.group(1).strip()
+            query = match.group(2).strip()
+        else:
+            query = match.group(1).strip()
+
+        break
+
+    # Also support commands such as:
+    # "Find text Auralink inside files"
+    if not content_intent:
+        match = re.search(
+            r"\b(?:find\s+text|search\s+content|search\s+inside|"
+            r"search\s+within|file\s+containing|document\s+containing)"
+            r"\s+(.+?)(?:\s+inside\s+files?)?\s*$",
+            command,
+            re.IGNORECASE,
+        )
+        if match:
+            content_intent = True
+            query = match.group(1).strip()
+
+    if query:
+        query = re.sub(r"\s+", " ", query).strip(" .,!?:;")
+
+    if not query and not (
+        ranking_most or ranking_least or ranking_largest
+    ):
+        content_intent = False
+
+    if content_intent:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from pypdf import PdfReader
+
+        extension_filter = None
+
+        wants_open = bool(re.search(
+            r"\b(open|kholo|khol|khul)\b", lowered
+        ))
+ 
+
+    if content_intent:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        from pypdf import PdfReader
+
+        extension_filter = None
+        for ext, aliases in {
+            ".pdf": ("pdf",),
+            ".docx": ("docx", "word document"),
+            ".txt": ("txt", "text file"),
+            ".md": ("markdown", ".md"),
+            ".py": ("python file", ".py"),
+            ".tsx": ("tsx",),
+            ".ts": ("typescript file",),
+            ".js": ("javascript file",),
+            ".csv": ("csv",),
+        }.items():
+            if any(alias in lowered for alias in aliases):
+                extension_filter = ext
+                break
+
+        wants_open = bool(re.search(
+            r"\b(open|kholo|khol|khul)\b", lowered
+        ))
+
+        
+       
+        # Generic parsing: separate file category from the text to search.
+        query = None
+        category_filter = None
+
+        command_text = command.strip()
+
+        # Example: Search resume with Shruti
+        match = re.match(
+            r"^(?:please\s+)?(?:search|find|look for)\s+"
+            r"(?:the\s+)?(resume|resumes|cv|cvs)\s+"
+            r"(?:for|with|containing|mentioning)\s+(.+?)\s*$",
+            command_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            category_filter = "resume"
+            query = match.group(2).strip()
+
+        # Example: Search operating system file with experiment 2
+        if query is None:
+            match = re.match(
+                r"^(?:please\s+)?(?:search|find|look for)\s+"
+                r"(.+?)\s+files?\s+(?:for|with|containing|mentioning)\s+"
+                r"(.+?)\s*$",
+                command_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                category_filter = match.group(1).strip()
+                query = match.group(2).strip()
+
+        # Example: Search files with Auralink
+        if query is None:
+            match = re.match(
+                r"^(?:please\s+)?(?:search|find|look for)\s+"
+                r"(?:all\s+)?files?\s+"
+                r"(?:with|containing|that\s+contain|mentioning)\s+"
+                r"(.+?)\s*$",
+                command_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                query = match.group(1).strip()
+
+        # Other explicit content-search forms
+        if query is None:
+            match = re.match(
+                r"^(?:please\s+)?(?:find text|search content|"
+                r"search inside|search within)\s+(.+?)"
+                r"(?:\s+inside files?)?\s*$",
+                command_text,
+                re.IGNORECASE,
+            )
+
+            if match:
+                query = match.group(1).strip()
+
+        if query:
+            query = re.sub(r"\s+", " ", query).strip(" .,!?:;")
+
+        if not query and not (
+            ranking_most or ranking_least or ranking_largest
+        ):
+            content_intent = False
+
+
+
+    if content_intent:
+        def extract_searchable_text(path):
+            suffix = path.suffix.casefold()
+            if suffix == ".pdf":
+                reader = PdfReader(str(path))
+                return "\n".join(page.extract_text() or "" for page in reader.pages)
+            if suffix == ".docx":
+                with zipfile.ZipFile(path) as archive:
+                    xml_data = archive.read("word/document.xml")
+                root = ET.fromstring(xml_data)
+                return " ".join(
+                    element.text or ""
+                    for element in root.iter()
+                    if element.tag.endswith("}t")
+                )
+            # Avoid reading very large source/log files into memory.
+            if path.stat().st_size > 5 * 1024 * 1024:
+                return ""
+            return path.read_text(encoding="utf-8", errors="ignore")
+
+        candidates = []
+        scanned = 0
+       
+
+        for item in scan_pc_files():
+            path = Path(item["path"])
+            suffix = path.suffix.casefold()
+
+            if suffix not in content_extensions:
+                continue
+            if extension_filter and suffix != extension_filter:
+                continue
+
+            if category_filter:
+                category_tokens = re.findall(
+                    r"[a-z0-9]+", category_filter.casefold()
+                )
+                filename_tokens = re.findall(
+                    r"[a-z0-9]+", path.stem.casefold()
+                )
+
+                if not all(
+                    token in filename_tokens
+                    for token in category_tokens
+                ):
+                    continue
+
+         
+
+            scanned += 1
+            if scanned > 2000:
+                break
+
+            try:
+                safe_path = resolve_pc_file(str(path))
+                extracted = extract_searchable_text(safe_path)
+                normalized = re.sub(r"[^a-z0-9]+", "", extracted.casefold())
+
+                # Ignore empty/unreadable content so it cannot win "least content".
+                if not extracted.strip():
+                    continue
+
+                
+                if query:
+                    normalized_query = re.sub(
+                        r"[^a-z0-9]+", "", query.casefold()
+                    )
+                    if not normalized_query or normalized_query not in normalized:
+                        continue
+                    occurrences = normalized.count(normalized_query)
+                else:
+                    occurrences = 0
+
+                candidates.append({
+                    "name": path.name,
+                    "path": str(safe_path),
+                    "extension": path.suffix.casefold(),
+                    "size_bytes": safe_path.stat().st_size,
+                    "words": len(extracted.split()),
+                    "characters": len(extracted),
+                    "occurrences": occurrences,
+                    "preview": " ".join(extracted.split())[:240],
+                })
+
+            except Exception:
+                continue
+
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No supported file matched the content query: {query}"
+                    if query else "No readable files matched the requested criteria."
+                ),
+            )
+
+        
+        if ranking_occurrences:
+            candidates.sort(
+                key=lambda item: item["occurrences"],
+                reverse=True,
+            )
+        elif ranking_most:
+            candidates.sort(key=lambda item: item["words"], reverse=True)
+        elif ranking_least:
+            candidates.sort(key=lambda item: item["words"])
+        elif ranking_largest:
+            candidates.sort(key=lambda item: item["size_bytes"], reverse=True)
+        else:
+            candidates.sort(key=lambda item: item["words"], reverse=True)
+
+
+        if not wants_open:
+            return {
+                "command": command,
+                "action": "search_file_content",
+                "query": query,
+                "count": len(candidates),
+                "scanned_files": scanned,
+                "results": candidates[:50],
+                "read_only": True,
+            }
+
+        if len(candidates) > 1 and not (ranking_most or ranking_least or ranking_largest):
+            return {
+                "command": command,
+                "action": "select_file",
+                "selection_required": True,
+                "message": "Multiple files match. Review the results before opening one.",
+                "query": query,
+                "results": candidates[:20],
+                "read_only": True,
+            }
+
+        selected = candidates[0]
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_file_by_content",
+            "query": query,
+            "selection": selected,
+            "scanned_files": scanned,
+            "read_only_search": True,
+            "result": opened,
+        }
+
+    # Open the latest matching file by modification date.
+    latest_resume_request = (
+        "resume" in lowered
+        and any(word in lowered for word in (
+            "latest", "last", "newest", "recent",
+            "sabse nayi", "sabse latest"
+        ))
+        and any(word in lowered for word in (
+            "open", "kholo", "khol", "khul"
+        ))
+    )
+
+    if latest_resume_request:
+        result = search_pc_files(query="resume", folder=None)
+        matches = [
+            item for item in result["matches"]
+            if Path(item["name"]).suffix.casefold() in {
+                ".pdf", ".doc", ".docx", ".odt"
+            }
+        ]
+
+        if not matches:
+            raise HTTPException(
+                status_code=404,
+                detail="No resume documents found in approved folders."
+            )
+
+        selected = max(
+            matches,
+            key=lambda item: item.get("modified_at", "")
+        )
+
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_latest_resume",
+            "result": opened,
+        }
+
+    # Open a named file, optionally restricted to an approved folder.
+    folder_open_match = re.fullmatch(
+        r"(.+?)\s+(?:mein|me|par|pe)\s+(.+?)\s+(?:open|kholo|khol|khul)(?:\s+kar)?",
+        lowered,
+    )
+
+    if folder_open_match:
+        folder_label = folder_open_match.group(1).strip()
+        target = folder_open_match.group(2).strip()
+
+        folder_aliases = {
+            "desktop": "Desktop",
+            "downloads": "Downloads",
+            "documents": "Documents",
+            "pictures": "Pictures",
+            "videos": "Videos",
+        }
+        selected_folder = folder_aliases.get(folder_label)
+
+        if selected_folder:
+            result = search_pc_files(target, folder=selected_folder)
+            matches = result["matches"]
+
+            exact = [
+                item for item in matches
+                if item["name"].casefold() == target.casefold()
+            ]
+
+            if len(exact) == 1:
+                selected = exact[0]
+            elif len(matches) == 1:
+                selected = matches[0]
+            else:
+                return {
+                    "command": command,
+                    "action": "select_file",
+                    "selection_required": True,
+                    "message": (
+                        "No matching file found."
+                        if not matches
+                        else "Multiple files match. Choose the exact file path."
+                    ),
+                    "result": result,
+                }
+
+            opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+            return {
+                "command": command,
+                "action": "open_pc_file",
+                "result": opened,
+            }
+
+    # Open a named file only if there is one unambiguous match.
+    open_match = re.fullmatch(
+        r"(?:open(?:\s+file)?|kholo|khol|khul)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if open_match:
+        target = open_match.group(1).strip()
+
+        if target.casefold() in {
+            "latest screenshot", "latest ss", "last screenshot",
+            "last ss", "newest screenshot",
+        }:
+            screenshot = latest_pc_screenshot()
+            opened = open_pc_file(OpenPcFileRequest(path=screenshot["path"]))
+            return {
+                "command": command,
+                "action": "open_latest_screenshot",
+                "result": opened,
+            }
+
+        result = search_pc_files(target)
+        matches = result["matches"]
+
+        exact = [
+            item for item in matches
+            if item["name"].casefold() == target.casefold()
+        ]
+
+        if len(exact) == 1:
+            selected = exact[0]
+        elif len(matches) == 1:
+            selected = matches[0]
+        else:
+            return {
+                "command": command,
+                "action": "select_file",
+                "selection_required": True,
+                "message": (
+                    "No matching file found."
+                    if not matches
+                    else "Multiple files match. Choose the exact file path."
+                ),
+                "result": result,
+            }
+
+        opened = open_pc_file(OpenPcFileRequest(path=selected["path"]))
+        return {
+            "command": command,
+            "action": "open_pc_file",
+            "result": opened,
+        }
+
+    # 1. System status
+    if lowered in {"system status", "pc status", "check system"}:
+        return {
+            "command": command,
+            "action": "system_status",
+            "result": get_system_status(),
+        }
+
+    # 2. List approved project files
+    if lowered in {"list files", "show files", "list project files"}:
+        return {
+            "command": command,
+            "action": "list_files",
+            "result": list_agent_files(),
+        }
+
+    # Generic content search: parse category and query from the command.
+    content_match = re.fullmatch(
+        r"(?:please\s+)?(?:search|find|look\s+for)\s+"
+        r"(?:all\s+)?files?\s+"
+        r"(?:with|containing|that\s+contain|mentioning)\s+(.+?)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if content_match:
+        content_query = content_match.group(1).strip()
+        content_command = f"Search files with {content_query}"
+        return await run_agent_command(
+            AgentCommandRequest(command=content_command)
+        )
+
+    content_match = re.fullmatch(
+        r"(?:please\s+)?(?:search|find|look\s+for)\s+"
+        r"(.+?)\s+(?:files?\s+)?"
+        r"(?:for|with|containing|mentioning)\s+(.+?)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if content_match:
+        category = re.sub(
+            r"\s+files?$", "", content_match.group(1).strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        content_query = content_match.group(2).strip()
+
+        if category and content_query:
+            content_command = (
+                f"Search {category} files for {content_query}"
+            )
+            return await run_agent_command(
+                AgentCommandRequest(command=content_command)
+            )
+
+    # 3. Search by filename
+    match = re.fullmatch(
+        r"(?:find|search)(?: file)?\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        query = match.group(1).strip()
+        return {
+            "command": command,
+            "action": "search_files",
+            "result": search_agent_files(query),
+        }
+
+    # 4. Read a text file within the approved project root
+    match = re.fullmatch(
+        r"read file\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        path = match.group(1).strip()
+        return {
+            "command": command,
+            "action": "read_file",
+            "result": read_agent_file(path),
+        }
+
+    # 5. Website QA
+    match = re.fullmatch(
+        r"test website\s+(https?://\S+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        url = match.group(1).strip()
+        try:
+            request_model = WebsiteTestRequest(url=url)
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="Invalid website URL.") from error
+
+        return {
+            "command": command,
+            "action": "website_qa",
+            "result": await test_website(request_model),
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Command not supported yet. Try: system status, list files, "
+            "find file Home.tsx, read file apps/web/src/App.tsx, "
+            "or test website http://localhost:5173"
+        ),
+    )
+
+
+from fastapi import HTTPException
+
+MONITOR_STATUS_PATH = (
+    Path.home() / ".local" / "state" / "vantex" / "status.json"
+)
+
+
+@app.get("/api/agent/monitor/status")
+def get_monitor_status():
+    if not MONITOR_STATUS_PATH.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail="VANTEX monitor status is not available yet.",
+        )
+
+    try:
+        import json
+
+        with MONITOR_STATUS_PATH.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read VANTEX monitor status.",
+        )
+
+
+# VANTEX File Operator — separate read/search/open permissions
+import subprocess
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+PC_FILE_ROOTS = [
+    (Path.home() / name).resolve()
+    for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos")
+    if (Path.home() / name).is_dir()
+]
+
+PC_SKIP_DIRS = {"venv", "env", ".tox", 
+    ".git", ".venv", "node_modules", "__pycache__",
+    "dist", "build", ".cache", ".local"
+}
+
+PC_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+PC_SCAN_LIMIT = 20000
+
+
+def resolve_pc_file(raw_path: str) -> Path:
+    """Resolve a file only inside approved personal folders."""
+    candidate = Path(raw_path).expanduser()
+
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file():
+            raise ValueError("Not a regular file")
+
+        if not any(
+            resolved.is_relative_to(root)
+            for root in PC_FILE_ROOTS
+        ):
+            raise ValueError("Outside approved folders")
+
+        return resolved
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(
+            status_code=403,
+            detail="File is missing or outside VANTEX approved folders."
+        )
+
+
+def scan_pc_files():
+    # Give every approved root its own scan budget so a large
+    # Desktop tree cannot prevent Pictures from being scanned.
+    for root in PC_FILE_ROOTS:
+        scanned = 0
+
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [
+                name for name in dirs
+                if name not in PC_SKIP_DIRS
+                and not name.startswith(".")
+                and not (Path(current) / name).is_symlink()
+            ]
+
+            for name in files:
+                candidate = Path(current) / name
+
+                if name.startswith(".") or candidate.is_symlink():
+                    continue
+
+                scanned += 1
+                if scanned > PC_SCAN_LIMIT:
+                    dirs[:] = []
+                    break
+
+                try:
+                    resolved = candidate.resolve(strict=True)
+
+                    if not any(
+                        resolved.is_relative_to(approved_root)
+                        for approved_root in PC_FILE_ROOTS
+                    ):
+                        continue
+
+                    stat = resolved.stat()
+                    if not resolved.is_file():
+                        continue
+
+                    yield {
+                        "name": resolved.name,
+                        "path": str(resolved),
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            stat.st_mtime
+                        ).astimezone().isoformat(),
+                        "_mtime": stat.st_mtime,
+                    }
+                except (OSError, ValueError, RuntimeError):
+                    continue
+
+
+def calculate_file_sha256(file_path: str) -> str:
+    """Read a file in chunks and return its SHA-256 hash."""
+    digest = hashlib.sha256()
+
+    with open(file_path, "rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+@app.get("/api/agent/pc-files/duplicates")
+def find_pc_file_duplicates(
+    min_size_bytes: int = Query(default=1, ge=1),
+):
+    """
+    Read-only duplicate scan.
+    Files are considered duplicates only when size and SHA-256 match.
+    No files are moved, edited, or deleted.
+    """
+    candidates_by_size = {}
+
+    for item in scan_pc_files():
+        size = item["size_bytes"]
+
+        if size < min_size_bytes:
+            continue
+
+        candidates_by_size.setdefault(size, []).append(item)
+
+    duplicate_groups = []
+    files_hashed = 0
+    bytes_hashed = 0
+
+    for size, items in candidates_by_size.items():
+        if len(items) < 2:
+            continue
+
+        candidates_by_hash = {}
+
+        for item in items:
+            try:
+                current_path = resolve_pc_file(item["path"])
+
+                # Avoid hashing a file that changed after the scan.
+                if current_path.stat().st_size != size:
+                    continue
+
+                file_hash = calculate_file_sha256(str(current_path))
+                files_hashed += 1
+                bytes_hashed += size
+
+                candidates_by_hash.setdefault(file_hash, []).append(item)
+
+            except (OSError, ValueError, RuntimeError, HTTPException):
+                continue
+
+        for file_hash, group in candidates_by_hash.items():
+            if len(group) < 2:
+                continue
+
+            for item in group:
+                item.pop("_mtime", None)
+
+            duplicate_groups.append({
+                "sha256": file_hash,
+                "size_bytes": size,
+                "copies": len(group),
+                "files": sorted(group, key=lambda item: item["path"]),
+            })
+
+    duplicate_groups.sort(
+        key=lambda group: (
+            group["size_bytes"] * (group["copies"] - 1),
+            group["size_bytes"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "read_only": True,
+        "files_hashed": files_hashed,
+        "bytes_hashed": bytes_hashed,
+        "duplicate_groups": duplicate_groups,
+        "duplicate_group_count": len(duplicate_groups),
+        "duplicate_copy_count": sum(
+            group["copies"] for group in duplicate_groups
+        ),
+        "potential_reclaimable_bytes": sum(
+            group["size_bytes"] * (group["copies"] - 1)
+            for group in duplicate_groups
+        ),
+        "note": "No files were modified or deleted.",
+    }
+
+
+
+@app.get("/api/agent/pc-files/search-content")
+def search_pc_pdf_content(
+    query: str = Query(min_length=1, max_length=200),
+    folder: str | None = Query(default=None, max_length=50),
+):
+    """Read-only search inside text-based PDF files in approved PC folders."""
+    from pypdf import PdfReader
+
+    needle = re.sub(r"[^a-z0-9]", "", query.casefold())
+    if not needle:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    allowed = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+    selected_folder = None
+    if folder:
+        selected_folder = allowed.get(folder.strip().casefold())
+        if selected_folder is None:
+            raise HTTPException(status_code=400, detail="Unsupported folder.")
+
+    matches = []
+    scanned = 0
+
+    for item in scan_pc_files():
+        path = Path(item["path"])
+        if path.suffix.casefold() != ".pdf":
+            continue
+
+        if selected_folder and path.parts[len(Path.home().parts)] != selected_folder:
+            continue
+
+        scanned += 1
+        if scanned > 500:
+            break
+
+        try:
+            safe_path = resolve_pc_file(str(path))
+            reader = PdfReader(str(safe_path))
+            extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+            normalized = re.sub(r"[^a-z0-9]", "", extracted.casefold())
+
+            if needle in normalized:
+                matches.append({
+                    "name": path.name,
+                    "path": str(path),
+                    "pages": len(reader.pages),
+                    "characters": len(extracted),
+                    "words": len(extracted.split()),
+                })
+        except Exception:
+            continue
+
+    return {
+        "query": query,
+        "folder": selected_folder,
+        "scanned_pdfs": scanned,
+        "count": len(matches),
+        "matches": matches,
+        "read_only": True,
+    }
+
+
+@app.get("/api/agent/pc-files/search")
+def search_pc_files(
+    query: str = Query(min_length=1, max_length=200),
+    folder: str | None = Query(default=None, max_length=50),
+):
+    needle = query.strip().casefold()
+    if not needle:
+        raise HTTPException(status_code=400, detail="Search query is empty.")
+
+    query_tokens = re.findall(r"[a-z0-9]+", needle)
+    matches = []
+
+        # Recognize natural-language file-type searches.
+    extension_aliases = {
+        "python": {".py"},
+        "javascript": {".js", ".jsx"},
+        "typescript": {".ts", ".tsx"},
+        "css": {".css"},
+        "html": {".html", ".htm"},
+        "json": {".json"},
+        "pdf": {".pdf"},
+        "markdown": {".md"},
+        "text": {".txt"},
+    }
+
+    requested_extensions = None
+    type_match = re.fullmatch(
+        r"(?:all\s+)?(python|javascript|typescript|css|html|json|pdf|markdown|text)"
+        r"(?:\s+(?:source\s+)?files?)?",
+        needle,
+    )
+
+    if type_match:
+        requested_extensions = extension_aliases[type_match.group(1)]
+
+    allowed_folder_names = {
+        "desktop": "Desktop",
+        "downloads": "Downloads",
+        "documents": "Documents",
+        "pictures": "Pictures",
+        "videos": "Videos",
+    }
+
+    selected_folder = None
+    if folder:
+        selected_folder = allowed_folder_names.get(folder.strip().casefold())
+        if selected_folder is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported folder. Use Desktop, Downloads, Documents, Pictures, or Videos."
+            )
+
+    for item in scan_pc_files():
+        if selected_folder and Path(item["path"]).parts[
+            len(Path.home().parts)
+        ] != selected_folder:
+            continue
+
+        if requested_extensions is not None:
+            if Path(item["name"]).suffix.casefold() not in requested_extensions:
+                continue
+
+        filename = item["name"].casefold()
+        filename_tokens = re.findall(r"[a-z0-9]+", filename)
+        stem = Path(filename).stem
+        stem_tokens = re.findall(r"[a-z0-9]+", stem)
+
+        if not query_tokens:
+            continue
+
+        matched_tokens = sum(
+            1 for token in query_tokens
+            if token in filename_tokens
+        )
+
+        if requested_extensions is None:
+            if matched_tokens != len(query_tokens):
+                continue
+
+        if needle in filename:
+            score = 100
+        else:
+            score = 80
+
+        # Prefer matching the main filename over an extension-only match.
+        if all(token in stem_tokens for token in query_tokens):
+            score += 10
+
+        # Small boost for common document types.
+        if Path(filename).suffix in {".pdf", ".doc", ".docx", ".odt"}:
+            score += 2
+
+        item["_score"] = score
+        matches.append(item)
+
+    # Relevance first; newer files break ties.
+    matches.sort(
+        key=lambda item: (item["_score"], item.get("_mtime", 0)),
+        reverse=True,
+    )
+
+    for item in matches:
+        item.pop("_mtime", None)
+        item.pop("_score", None)
+
+    return {
+        "query": query,
+        "folder": selected_folder,
+        "roots": (
+            [str(root) for root in PC_FILE_ROOTS
+             if not selected_folder or root.name == selected_folder]
+        ),
+        "matches": matches[:100],
+        "count": min(len(matches), 100),
+        "scan_limit": PC_SCAN_LIMIT,
+        "sorted_by": "relevance_then_modified_date",
+    }
+
+
+@app.get("/api/agent/pc-files/latest-screenshot")
+def latest_pc_screenshot():
+    screenshots = []
+
+    for item in scan_pc_files():
+        name = item["name"].casefold()
+        path = item["path"].casefold()
+
+        is_screenshot = (
+            item["name"].lower().endswith(tuple(PC_IMAGE_EXTENSIONS))
+            and (
+                "screenshot" in name
+                or "screen shot" in name
+                or "screenshots" in path
+            )
+        )
+
+        if is_screenshot:
+            screenshots.append(item)
+
+    if not screenshots:
+        raise HTTPException(
+            status_code=404,
+            detail="No screenshots found in approved folders."
+        )
+
+    latest = max(screenshots, key=lambda item: item["_mtime"])
+    latest.pop("_mtime", None)
+    return latest
+
+
+class OpenPcFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/api/agent/pc-files/open")
+def open_pc_file(request: OpenPcFileRequest):
+    file_path = resolve_pc_file(request.path)
+
+    try:
+        subprocess.Popen(
+            ["xdg-open", str(file_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not launch the default application: {error}"
+        ) from error
+
+    return {
+        "opened": True,
+        "name": file_path.name,
+        "path": str(file_path),
+        "message": "Open request sent to the default desktop application."
+    }

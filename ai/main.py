@@ -62,110 +62,505 @@ def get_system_status():
         },
     }
 
+
 @app.post("/api/qa/test")
 async def test_website(request: WebsiteTestRequest):
-    url = str(request.url)
-    parsed = urlparse(url)
+    from collections import deque
+    from urllib.parse import urldefrag, urlunparse
+    import xml.etree.ElementTree as ET
+    import re
 
-    if parsed.scheme not in ("http", "https"):
-        raise HTTPException(status_code=400, detail="Only HTTP and HTTPS URLs are supported.")
+    start_url = str(request.url)
+    parsed_start = urlparse(start_url)
 
-    console_errors = []
-    failed_requests = []
-    page_errors = []
-    broken_links = []
+    if parsed_start.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only HTTP and HTTPS URLs are supported."
+        )
+
+    def normalize_url(raw_url):
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        parsed = parsed._replace(fragment="")
+        return urlunparse(parsed)
+
+    def same_origin(first, second):
+        a, b = urlparse(first), urlparse(second)
+        return (
+            a.scheme.lower() == b.scheme.lower()
+            and (a.hostname or "").lower() == (b.hostname or "").lower()
+            and (a.port or (443 if a.scheme == "https" else 80))
+            == (b.port or (443 if b.scheme == "https" else 80))
+        )
+
+    start_url = normalize_url(start_url)
+    queue = deque([(start_url, 0)])
+    queued = {start_url}
+    visited = set()
+    pages = []
+    external_links = {}
+    max_pages = 50
+    max_depth = 5
+    max_links_per_page = 100
+    max_external_checks = 50
+
+    discovered_urls = {start_url}
+
+    async def discover_sitemap_urls(request_context, base_url):
+        """Discover same-origin URLs through robots.txt and XML sitemaps."""
+        origin = urlparse(base_url)
+        robots_url = f"{origin.scheme}://{origin.netloc}/robots.txt"
+        sitemap_queue = []
+        found_pages = set()
+
+        try:
+            response = await request_context.get(
+                robots_url, timeout=7000, fail_on_status_code=False
+            )
+            if response.status < 400:
+                robots_text = await response.text()
+                for line in robots_text.splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key.strip().lower() == "sitemap":
+                        candidate = normalize_url(value.strip())
+                        if candidate and same_origin(base_url, candidate):
+                            sitemap_queue.append(candidate)
+        except Exception:
+            pass
+
+        # Standard fallback for sites that do not declare a sitemap in robots.txt.
+        fallback = normalize_url(urljoin(base_url, "/sitemap.xml"))
+        if fallback and fallback not in sitemap_queue:
+            sitemap_queue.append(fallback)
+
+        seen_sitemaps = set()
+        max_sitemaps = 10
+
+        while sitemap_queue and len(seen_sitemaps) < max_sitemaps:
+            sitemap_url = sitemap_queue.pop(0)
+            if sitemap_url in seen_sitemaps:
+                continue
+            seen_sitemaps.add(sitemap_url)
+
+            try:
+                response = await request_context.get(
+                    sitemap_url, timeout=7000, fail_on_status_code=False
+                )
+                if response.status >= 400:
+                    continue
+
+                body = await response.text()
+                if len(body) > 5_000_000:
+                    continue
+
+                root = ET.fromstring(body)
+                for element in root.iter():
+                    if element.tag.rsplit("}", 1)[-1].lower() != "loc":
+                        continue
+
+                    value = (element.text or "").strip()
+                    candidate = normalize_url(urljoin(sitemap_url, value))
+                    if not candidate or not same_origin(base_url, candidate):
+                        continue
+
+                    # Sitemap indexes contain sitemap URLs; ordinary sitemaps
+                    # contain page URLs. Both are handled without fixed routes.
+                    if candidate.lower().endswith(".xml"):
+                        if candidate not in seen_sitemaps:
+                            sitemap_queue.append(candidate)
+                    else:
+                        found_pages.add(candidate)
+
+                    if len(found_pages) >= 2000:
+                        return found_pages
+            except Exception:
+                continue
+
+        return found_pages
+
+    async def discover_bundle_routes(page, request_context, base_url):
+        """Discover static SPA route candidates from same-origin JS bundles."""
+        candidates = set()
+
+        try:
+            script_urls = await page.locator("script[src]").evaluate_all(
+                "els => els.map(el => el.src).filter(Boolean)"
+            )
+        except Exception:
+            return candidates
+
+        for script_url in script_urls[:20]:
+            normalized_script = normalize_url(script_url)
+            if not normalized_script or not same_origin(base_url, normalized_script):
+                continue
+
+            try:
+                response = await request_context.get(
+                    normalized_script, timeout=10000, fail_on_status_code=False
+                )
+                if response.status >= 400:
+                    continue
+
+                body = await response.text()
+                if len(body) > 5_000_000:
+                    continue
+
+                patterns = [
+                    r'path\s*:\s*`([^`]+)`',
+                    r'path\s*:\s*"([^"]+)"',
+                    r"path\s*:\s*'([^']+)'",
+                ]
+
+                for pattern in patterns:
+                    for match in re.finditer(pattern, body):
+                        route = match.group(1).strip()
+
+                        # Keep only literal absolute route paths.
+                        if (
+                            not route.startswith("/")
+                            or route.startswith("//")
+                            or len(route) > 150
+                            or any(c in route for c in (" ", "\n", "<", ">"))
+                            or any(c in route for c in (":", "*", "{", "}"))
+                        ):
+                            continue
+
+                        candidate = normalize_url(urljoin(base_url, route))
+                        if candidate and same_origin(base_url, candidate):
+                            candidates.add(candidate)
+
+            except Exception:
+                continue
+
+        return candidates
+
+    browser = None
 
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(ignore_https_errors=False)
 
-            page = await browser.new_page()
-            page.set_default_timeout(10000)
-
-            page.on(
-                "console",
-                lambda message: console_errors.append(message.text)
-                if message.type == "error"
-                else None,
+            sitemap_urls = await discover_sitemap_urls(
+                context.request, start_url
             )
+            discovered_urls.update(sitemap_urls)
 
-            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            for sitemap_url in sorted(sitemap_urls):
+                if len(queued) >= max_pages:
+                    break
+                if sitemap_url not in queued:
+                    queued.add(sitemap_url)
+                    queue.append((sitemap_url, 1))
 
-            page.on(
-                "requestfailed",
-                lambda req: failed_requests.append({
-                    "url": req.url,
-                    "error": req.failure,
-                }),
-            )
+            while queue and len(visited) < max_pages:
+                current_url, depth = queue.popleft()
 
-            try:
-                response = await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=20000,
+                if current_url in visited:
+                    continue
+
+                visited.add(current_url)
+                page_result = {
+                    "url": current_url,
+                    "depth": depth,
+                    "title": None,
+                    "final_url": None,
+                    "http_status": None,
+                    "success": False,
+                    "console_errors": [],
+                    "page_errors": [],
+                    "failed_requests": [],
+                    "broken_links": [],
+                    "links_checked": 0,
+                    "responsive_checks": [],
+                    "summary": {},
+                }
+
+                page = await context.new_page()
+                page.set_default_timeout(10000)
+
+                page.on(
+                    "console",
+                    lambda message, result=page_result:
+                        result["console_errors"].append(message.text)
+                        if message.type == "error"
+                        and len(result["console_errors"]) < 30 else None
                 )
-            except PlaywrightTimeoutError:
-                await browser.close()
-                raise HTTPException(
-                    status_code=504,
-                    detail="Website navigation timed out.",
+                page.on(
+                    "pageerror",
+                    lambda error, result=page_result:
+                        result["page_errors"].append(str(error)[:300])
+                        if len(result["page_errors"]) < 30 else None
+                )
+                page.on(
+                    "requestfailed",
+                    lambda req, result=page_result:
+                        result["failed_requests"].append({
+                            "url": req.url,
+                            "error": req.failure,
+                        })
+                        if len(result["failed_requests"]) < 30 else None
                 )
 
-            title = await page.title()
-            final_url = page.url
-            status_code = response.status if response else None
+                discovered_internal = set()
 
-            links = await page.locator("a[href]").evaluate_all(
-                """elements => elements
-                    .map(a => a.href)
-                    .filter(href => href.startsWith('http://') ||
-                                    href.startsWith('https://'))
-                """
-            )
-
-            unique_links = list(dict.fromkeys(links))[:15]
-
-            for link in unique_links:
                 try:
-                    result = await page.request.get(
-                        link,
-                        timeout=7000,
-                        fail_on_status_code=False,
+                    try:
+                        response = await page.goto(
+                            current_url,
+                            wait_until="domcontentloaded",
+                            timeout=20000,
+                        )
+                    except PlaywrightTimeoutError:
+                        page_result["navigation_error"] = "Navigation timed out."
+                        response = None
+                    except Exception as error:
+                        page_result["navigation_error"] = str(error)[:300]
+                        response = None
+
+                    page_result["final_url"] = page.url
+                    page_result["title"] = await page.title()
+                    page_result["http_status"] = (
+                        response.status if response else None
                     )
 
-                    if result.status >= 400:
-                        broken_links.append({
-                            "url": link,
-                            "status": result.status,
+                    requested_url = normalize_url(current_url)
+                    final_url = normalize_url(page.url)
+                    redirected = bool(
+                        requested_url and final_url and requested_url != final_url
+                    )
+
+                    # A redirected route is authentication-required only when the
+                    # destination looks like a login form. The login page itself
+                    # is not classified as protected just because it has a password.
+                    has_password_field = await page.locator(
+                        'input[type="password"]'
+                    ).count() > 0
+                    has_login_field = await page.locator(
+                        'input[type="email"], input[autocomplete="username"], '
+                        'input[name*="email" i], input[name*="user" i]'
+                    ).count() > 0
+
+                    page_result["auth_required"] = bool(
+                        redirected and has_password_field and has_login_field
+                    )
+                    page_result["status"] = (
+                        "AUTH_REQUIRED" if page_result["auth_required"]
+                        else "TESTED"
+                    )
+                    page_result["success"] = bool(
+                        response
+                        and response.status < 400
+                        and not page_result["auth_required"]
+                    )
+
+                    # Discover links on this page. Only same-origin links enter
+                    # the crawl queue; external links are checked separately.
+                    raw_links = await page.locator("a[href]").evaluate_all(
+                        """els => els.map(a => a.href).filter(Boolean)"""
+                    )
+
+                    for raw_link in raw_links[:max_links_per_page]:
+                        normalized = normalize_url(raw_link)
+                        if not normalized:
+                            continue
+
+                        if same_origin(start_url, normalized):
+                            discovered_urls.add(normalized)
+                            if normalized not in visited:
+                                discovered_internal.add(normalized)
+                        else:
+                            external_links.setdefault(normalized, None)
+
+                    page_result["links_checked"] = min(
+                        len(raw_links), max_links_per_page
+                    )
+
+                    # Discover static SPA route candidates from same-origin bundles.
+                    # These are candidates, not proof that a page is accessible.
+                    bundle_routes = await discover_bundle_routes(
+                        page, context.request, start_url
+                    )
+                    discovered_urls.update(bundle_routes)
+                    discovered_internal.update(bundle_routes)
+
+                    # Responsive horizontal-overflow checks.
+                    viewports = [
+                        {"name": "desktop", "width": 1440, "height": 900},
+                        {"name": "tablet", "width": 768, "height": 1024},
+                        {"name": "mobile", "width": 390, "height": 844},
+                    ]
+
+                    for viewport in viewports:
+                        await page.set_viewport_size({
+                            "width": viewport["width"],
+                            "height": viewport["height"],
                         })
+                        await page.wait_for_timeout(150)
+
+                        layout = await page.evaluate("""() => {
+                            const viewportWidth =
+                                document.documentElement.clientWidth;
+                            const documentWidth = Math.max(
+                                document.documentElement.scrollWidth,
+                                document.body ? document.body.scrollWidth : 0
+                            );
+                            const overflowing = [];
+
+                            for (const element of document.querySelectorAll("body *")) {
+                                if (overflowing.length >= 20) break;
+                                const rect = element.getBoundingClientRect();
+                                const style = getComputedStyle(element);
+
+                                if (
+                                    rect.width > 0 &&
+                                    rect.height > 0 &&
+                                    style.position !== "fixed" &&
+                                    (rect.left < -1 ||
+                                     rect.right > viewportWidth + 1)
+                                ) {
+                                    overflowing.push({
+                                        element: (
+                                            element.tagName.toLowerCase() +
+                                            (element.id ? "#" + element.id : "")
+                                        ).slice(0, 160),
+                                        left: Math.round(rect.left),
+                                        right: Math.round(rect.right),
+                                        width: Math.round(rect.width)
+                                    });
+                                }
+                            }
+
+                            return {
+                                viewport_width: viewportWidth,
+                                document_width: documentWidth,
+                                horizontal_overflow:
+                                    documentWidth > viewportWidth + 1,
+                                overflowing_elements: overflowing
+                            };
+                        }""")
+
+                        page_result["responsive_checks"].append({
+                            **viewport,
+                            **layout,
+                            "passed": not layout["horizontal_overflow"],
+                        })
+
                 except Exception as error:
-                    broken_links.append({
-                        "url": link,
-                        "error": str(error)[:180],
-                    })
+                    page_result["page_test_error"] = str(error)[:300]
+                finally:
+                    await page.close()
+
+                page_result["summary"] = {
+                    "console_error_count": len(page_result["console_errors"]),
+                    "page_error_count": len(page_result["page_errors"]),
+                    "failed_request_count": len(page_result["failed_requests"]),
+                    "responsive_viewports_tested":
+                        len(page_result["responsive_checks"]),
+                    "responsive_viewports_failed": sum(
+                        1 for item in page_result["responsive_checks"]
+                        if not item["passed"]
+                    ),
+                }
+                pages.append(page_result)
+
+                if depth < max_depth:
+                    for discovered_url in sorted(discovered_internal):
+                        if discovered_url not in queued and len(queued) < max_pages:
+                            queued.add(discovered_url)
+                            queue.append((discovered_url, depth + 1))
 
             await browser.close()
+            browser = None
 
-            return {
-                "success": True,
-                "tested_url": url,
-                "final_url": final_url,
-                "title": title,
-                "http_status": status_code,
-                "console_errors": console_errors[:30],
-                "page_errors": page_errors[:30],
-                "failed_requests": failed_requests[:30],
-                "broken_links": broken_links,
-                "links_checked": len(unique_links),
-                "summary": {
-                    "console_error_count": len(console_errors),
-                    "page_error_count": len(page_errors),
-                    "failed_request_count": len(failed_requests),
-                    "broken_link_count": len(broken_links),
-                },
-                "note": "Detection only. No source files were modified.",
-            }
+        # Check a bounded number of external links separately. Never crawl
+        # their pages or execute their JavaScript.
+        external_results = []
+        async with async_playwright() as playwright:
+            request_context = await playwright.request.new_context(
+                timeout=7000,
+                ignore_https_errors=False,
+            )
+            for external_url in list(external_links.keys())[:max_external_checks]:
+                result = {"url": external_url, "status": None, "error": None}
+                try:
+                    response = await request_context.get(
+                        external_url,
+                        fail_on_status_code=False,
+                    )
+                    result["status"] = response.status
+                    result["broken"] = response.status >= 400
+                except Exception as error:
+                    result["error"] = str(error)[:180]
+                    result["broken"] = True
+                external_results.append(result)
+            await request_context.dispose()
+
+        total_console_errors = sum(len(p["console_errors"]) for p in pages)
+        total_page_errors = sum(len(p["page_errors"]) for p in pages)
+        total_failed_requests = sum(len(p["failed_requests"]) for p in pages)
+        total_responsive_failed = sum(
+            item["summary"].get("responsive_viewports_failed", 0)
+            for item in pages
+        )
+        failed_pages = sum(
+            1 for p in pages
+            if not p["success"] and not p.get("auth_required")
+        )
+
+        # Keep legacy fields for the existing frontend, and provide the
+        # detailed per-page report alongside them.
+        first = pages[0] if pages else {}
+        return {
+            "success": bool(pages) and not failed_pages,
+            "tested_url": start_url,
+            "final_url": first.get("final_url"),
+            "title": first.get("title"),
+            "http_status": first.get("http_status"),
+            "console_errors": first.get("console_errors", []),
+            "page_errors": first.get("page_errors", []),
+            "failed_requests": first.get("failed_requests", []),
+            "broken_links": external_results,
+            "links_checked": sum(p["links_checked"] for p in pages),
+            "responsive_checks": first.get("responsive_checks", []),
+            "pages": pages,
+            "external_links": external_results,
+            "pages_discovered": len(discovered_urls),
+            "pages_tested": len(pages),
+            "pages_auth_required": sum(
+                1 for p in pages if p.get("auth_required")
+            ),
+            "pages_failed": failed_pages,
+            "crawl_limit": max_pages,
+            "summary": {
+                "pages_tested": len(pages),
+                "pages_failed": failed_pages,
+                "pages_auth_required": sum(
+                    1 for p in pages if p.get("auth_required")
+                ),
+                "console_error_count": total_console_errors,
+                "page_error_count": total_page_errors,
+                "failed_request_count": total_failed_requests,
+                "external_links_checked": len(external_results),
+                "external_broken_link_count": sum(
+                    1 for item in external_results if item.get("broken")
+                ),
+                "responsive_viewports_tested": sum(
+                    len(p["responsive_checks"]) for p in pages
+                ),
+                "responsive_viewports_failed": total_responsive_failed,
+            },
+            "note": (
+                "Pages are discovered from rendered same-origin links and "
+                "robots.txt/XML sitemaps. Crawl limits are currently 50 pages "
+                "and depth 5; up to 50 external links are checked separately. "
+                "Hidden routes, login-protected pages and button-only navigation "
+                "may require additional discovery or an authorized login session. "
+                "Responsive checks detect horizontal overflow, not every visual defect."
+            ),
+        }
 
     except HTTPException:
         raise
@@ -174,6 +569,9 @@ async def test_website(request: WebsiteTestRequest):
             status_code=500,
             detail=f"Website test failed: {str(error)[:250]}",
         ) from error
+
+# VANTEX Local File Access — initial restricted version
+
 
 # VANTEX Local File Access — initial restricted version
 

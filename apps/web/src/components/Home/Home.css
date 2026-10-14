@@ -1099,3 +1099,220 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+
+/* Website QA report */
+.home-shell .qa-report {
+  width: 100%;
+  margin-top: 20px;
+  padding-top: 19px;
+  border-top: 1px solid rgba(66, 229, 165, 0.18);
+}
+
+.home-shell .qa-report-heading,
+.home-shell .qa-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.home-shell .qa-eyebrow {
+  color: #54dca1;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.15em;
+}
+
+.home-shell .qa-report h3 {
+  margin: 6px 0 0;
+  color: #e8fff4;
+  font-size: 15px;
+}
+
+.home-shell .qa-section-heading p {
+  margin: 5px 0 0;
+  color: #81978f;
+  font-size: 11px;
+}
+
+.home-shell .qa-status,
+.home-shell .qa-mini-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  padding: 6px 9px;
+  border: 1px solid rgba(66, 229, 165, 0.2);
+  border-radius: 7px;
+  color: #73e8b5;
+  background: rgba(24, 111, 75, 0.12);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+}
+
+.home-shell .qa-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #42e5a5;
+  box-shadow: 0 0 9px rgba(66, 229, 165, 0.6);
+}
+
+.home-shell .qa-status.is-fail,
+.home-shell .qa-mini-status.is-fail {
+  color: #ff9da7;
+  border-color: rgba(255, 104, 119, 0.25);
+  background: rgba(120, 28, 43, 0.16);
+}
+
+.home-shell .qa-status.is-neutral {
+  color: #a4b4c9;
+  border-color: rgba(126, 161, 210, 0.2);
+  background: rgba(126, 161, 210, 0.08);
+}
+
+.home-shell .qa-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 17px;
+}
+
+.home-shell .qa-metric,
+.home-shell .qa-viewport {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid rgba(126, 161, 210, 0.13);
+  border-radius: 10px;
+  background: rgba(3, 12, 15, 0.62);
+}
+
+.home-shell .qa-metric > span {
+  display: block;
+  min-height: 27px;
+  color: #91a69e;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.home-shell .qa-metric strong {
+  display: block;
+  margin-top: 7px;
+  color: #72e8b5;
+  font-size: 23px;
+}
+
+.home-shell .qa-metric strong.has-issues {
+  color: #ff9da7;
+}
+
+.home-shell .qa-responsive {
+  margin-top: 24px;
+}
+
+.home-shell .qa-viewport-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 13px;
+}
+
+.home-shell .qa-viewport-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+}
+
+.home-shell .qa-device-icon {
+  color: #65e5ae;
+  font-size: 22px;
+}
+
+.home-shell .qa-viewport h4 {
+  margin: 13px 0 4px;
+  color: #e3f8ed;
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.home-shell .qa-viewport > p {
+  margin: 0 0 14px;
+  color: #81978f;
+  font-size: 10px;
+}
+
+.home-shell .qa-width-detail {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 5px;
+  margin-top: 9px;
+  color: #91a69e;
+  font-size: 10px;
+}
+
+.home-shell .qa-width-detail strong {
+  color: #d4f5e3;
+  font-size: 10px;
+}
+
+.home-shell .qa-overflow-details {
+  margin-top: 13px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 104, 119, 0.18);
+}
+
+.home-shell .qa-overflow-details summary {
+  color: #ffabb3;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.home-shell .qa-overflow-details ul {
+  margin: 10px 0 0;
+  padding-left: 16px;
+  color: #d6a8ad;
+  font-size: 10px;
+}
+
+.home-shell .qa-overflow-details li {
+  margin-top: 9px;
+  overflow-wrap: anywhere;
+}
+
+.home-shell .qa-overflow-details code {
+  display: block;
+  color: #ffc0c6;
+}
+
+.home-shell .qa-overflow-details li span {
+  display: block;
+  margin-top: 4px;
+}
+
+.home-shell .qa-raw-details {
+  margin-top: 18px;
+}
+
+@media (max-width: 560px) {
+  .home-shell .qa-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .home-shell .qa-viewport-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .home-shell .qa-report-heading,
+  .home-shell .qa-section-heading {
+    align-items: flex-start;
+  }
+
+  .home-shell .qa-status {
+    max-width: 50%;
+    white-space: normal;
+  }
+}
