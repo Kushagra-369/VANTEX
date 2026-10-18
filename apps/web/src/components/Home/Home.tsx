@@ -281,21 +281,40 @@ function detectIntent(input: string) {
     return { type: 'content' as const, query: query || text };
   }
 
-  // Filename/folder search.
+
+  // Filename/folder search, including Hindi and Hinglish.
   const isFileSearch =
-    /\b(find|search|locate|list|show|dikha|dikhao|dikhaye|bata|batao|dhoondh|dhundh|dhundho|khoj)\b/i.test(text) &&
+    /\b(find|search|locate|list|show|dikha|dikhao|dikhaye|bata|batao|dhoondh|dhundh|dhundho|khoj|nikaal|nikal)\b/i.test(text) &&
     /\b(file|files|folder|folders|document|documents|resume|resumes|cv|cvs|pdf|python|javascript|typescript|css|html|json|tsx|ts|jsx|js|py|md)\b/i.test(text);
 
   if (isFileSearch) {
-    const query = text
+    const folderMatch = text.match(
+      /\b(desktop|downloads|documents|pictures|videos)\b/i,
+    );
+
+    const typeMatch = text.match(
+      /\b(python|javascript|typescript|css|html|json|pdf|markdown|text)\b/i,
+    );
+
+    const cleanedQuery = text
       .replace(
-        /\b(please|mujhe|mera|meri|mere|saari|saare|sari|sare|sabhi|sab|all|my|the|for|find|search|locate|list|show|give|me|de|do|dikha|dikhao|dikhaye|bata|batao|dhoondh|dhundh|dhundho|khoj|nikaal|nikal|files|file|folders|folder|documents|document|in my pc|on my pc|on my computer)\b/gi,
+        /\b(please|bhai|mujhe|mera|meri|mere|saari|saare|sari|sare|sabhi|sab|all|my|the|for|find|search|locate|list|show|give|me|de|do|dikha|dikhao|dikhaye|bata|batao|dhoondh|dhundh|dhundho|khoj|nikaal|nikal|files|file|folders|folder|documents|document|desktop|downloads|pictures|videos|in|inside|from|on|my|pc|computer|laptop|wali|wala|wale|waali|waala|waale|please)\b/gi,
         ' ',
       )
       .replace(/\s+/g, ' ')
       .trim();
 
-    return { type: 'files' as const, query: query || text };
+    const query = typeMatch
+      ? typeMatch[1].toLowerCase()
+      : cleanedQuery;
+
+    return {
+      type: 'files' as const,
+      query: query || cleanedQuery || text,
+      folder: folderMatch
+        ? folderMatch[1].toLowerCase()
+        : undefined,
+    };
   }
 
   // Keep unsupported/other requests available to the local command handler.
@@ -1411,14 +1430,12 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
   const spokenText = error || result?.message || '';
 
 
+
   useEffect(() => {
     if (!voiceReplyEnabled || !spokenText.trim()) return;
     if (lastSpokenRef.current === spokenText) return;
 
     let cancelled = false;
-    let audioElement: HTMLAudioElement | null = null;
-    let audioUrl: string | null = null;
-    let completed = false;
 
     const resumeListening = () => {
       speakingRef.current = false;
@@ -1426,7 +1443,13 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
       if (!voiceModeRef.current || cancelled) return;
 
       window.setTimeout(() => {
-        if (!voiceModeRef.current || speakingRef.current || cancelled) return;
+        if (
+          cancelled ||
+          !voiceModeRef.current ||
+          speakingRef.current
+        ) {
+          return;
+        }
 
         try {
           restartingRef.current = true;
@@ -1434,117 +1457,93 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
         } catch {
           restartingRef.current = false;
         }
-      }, 400);
+      }, 500);
     };
 
-    const playBrowserVoice = () => {
+    const speak = () => {
       if (cancelled) return;
 
-      if (!('speechSynthesis' in window)) {
-        console.error('[VANTEX TTS] No browser speech support');
-        resumeListening();
-        return;
-      }
+      const voices = window.speechSynthesis.getVoices();
 
-      window.speechSynthesis.cancel();
+      const femaleVoice = voices.find((voice) =>
+        /female|samantha|zira|aria|jenny|google us english/i.test(
+          voice.name,
+        ),
+      );
+
+      const englishVoice =
+        femaleVoice ??
+        voices.find((voice) => /^en(-|_)/i.test(voice.lang));
 
       const utterance = new SpeechSynthesisUtterance(spokenText);
-      utterance.lang = 'en-US';
+
+      if (englishVoice) {
+        utterance.voice = englishVoice;
+      }
+
+      utterance.lang = englishVoice?.lang || 'en-US';
       utterance.rate = 0.95;
+      utterance.pitch = 1.05;
+      utterance.volume = 1;
+
+      utterance.onstart = () => {
+        console.log('[VANTEX TTS] Browser voice started');
+      };
 
       utterance.onend = () => {
+        if (cancelled) return;
+
         lastSpokenRef.current = spokenText;
         resumeListening();
       };
 
       utterance.onerror = (event) => {
-        console.error('[BROWSER TTS] Error:', event.error);
+        console.error('[VANTEX TTS] Browser voice error:', event.error);
         resumeListening();
       };
 
       window.speechSynthesis.speak(utterance);
     };
 
-    const playReply = async () => {
-      speakingRef.current = true;
-      recognitionRef.current?.stop();
-      setVoiceListening(false);
+    speakingRef.current = true;
+    recognitionRef.current?.stop();
+    setVoiceListening(false);
 
-      try {
-        const tts = await getKokoro();
-        if (cancelled) return;
+    window.speechSynthesis.cancel();
 
-        const stream = tts.stream(spokenText, {
-          voice: 'af_bella',
-          speed: 0.95,
-          split_pattern: /(?<=[.!?])\s+/,
-        });
+    // Wait briefly for the browser's voice list to initialize.
+    if (window.speechSynthesis.getVoices().length > 0) {
+      speak();
+    } else {
+      const onVoicesChanged = () => {
+        window.speechSynthesis.removeEventListener(
+          'voiceschanged',
+          onVoicesChanged,
+        );
+        speak();
+      };
 
-        for await (const chunk of stream) {
-          if (cancelled) return;
+      window.speechSynthesis.addEventListener(
+        'voiceschanged',
+        onVoicesChanged,
+      );
 
-          const url = URL.createObjectURL(chunk.audio.toBlob());
-          const player = new Audio(url);
-
-          audioUrl = url;
-          audioElement = player;
-
-          console.log('[KOKORO PLAY]', chunk.text);
-
-          try {
-            await new Promise<void>((resolve, reject) => {
-              player.onended = () => resolve();
-              player.onerror = () =>
-                reject(new Error('Kokoro audio playback failed'));
-
-              player.play().catch(reject);
-            });
-          } finally {
-            player.onended = null;
-            player.onerror = null;
-            player.pause();
-            player.removeAttribute('src');
-            player.load();
-            URL.revokeObjectURL(url);
-
-            if (audioUrl === url) audioUrl = null;
-            if (audioElement === player) audioElement = null;
-          }
-        }
-
-        if (cancelled) return;
-
-        completed = true;
-        lastSpokenRef.current = spokenText;
-        resumeListening();
-      } catch (err) {
-        if (cancelled) return;
-
-        console.error('[VANTEX TTS] Kokoro failed:', err);
-        playBrowserVoice();
-      }
-    };
-
-    void playReply();
+      // Avoid waiting forever if the browser never fires voiceschanged.
+      window.setTimeout(() => {
+        window.speechSynthesis.removeEventListener(
+          'voiceschanged',
+          onVoicesChanged,
+        );
+        speak();
+      }, 1000);
+    }
 
     return () => {
       cancelled = true;
-
-      if (audioElement) {
-        audioElement.onended = null;
-        audioElement.onerror = null;
-        audioElement.pause();
-        audioElement.removeAttribute('src');
-      }
-
-      if (audioUrl) URL.revokeObjectURL(audioUrl);
-
-      // Do not mark an interrupted reply as spoken.
-      if (!completed) {
-        console.info('[VANTEX TTS] Playback interrupted');
-      }
+      window.speechSynthesis.cancel();
     };
   }, [spokenText, voiceReplyEnabled]);
+
 
 
   useEffect(() => {
@@ -1563,18 +1562,30 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
     setError('');
   }
 
-  async function searchFiles(query: string, contentSearch = false) {
-    console.log("[VANTEX] Search query:", query);
-    console.log("[VANTEX] Content search:", contentSearch);
+
+  async function searchFiles(
+    query: string,
+    contentSearch = false,
+    folder?: string,
+  ) {
+    console.log('[VANTEX] Search query:', query);
+    console.log('[VANTEX] Search folder:', folder ?? 'all folders');
+    console.log('[VANTEX] Content search:', contentSearch);
+
     const endpoint = contentSearch
       ? '/api/agent/pc-files/search-content'
       : '/api/agent/pc-files/search';
 
-    const url = `${API}${endpoint}?${new URLSearchParams({
-      query,
-    }).toString()}`;
+    const params = new URLSearchParams({ query });
 
-    const data = await requestJSON(url);
+    if (folder) {
+      params.set('folder', folder.charAt(0).toUpperCase() + folder.slice(1));
+    }
+
+    const data = await requestJSON(
+      `${API}${endpoint}?${params.toString()}`,
+    );
+
     const files = findFileItems(data);
 
     setResult({
@@ -1589,6 +1600,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
       data,
     });
   }
+
 
   async function openFile(file: FileItem) {
     setOpeningPath(file.path);
@@ -1619,6 +1631,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
       setOpeningPath('');
     }
   }
+
 
 
 
@@ -1695,28 +1708,58 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
         return;
       }
 
-      // Search filenames and folders.
+      // Route filename searches and searches inside file contents separately.
       if (intent.type === 'files') {
-        await searchFiles(intent.query);
+        const wantsContent = /\b(with|containing|contains|inside|mentioning|mentions|whose content|text contains)\b/i.test(input)
+          && /\b(resume|resumes|cv|cvs|file|files|pdf|document|documents)\b/i.test(input);
+
+        const contentQuery = wantsContent
+          ? input
+              .replace(/\b(find|search|locate|list|show|please|bhai|mujhe|mera|meri|mere|all|my|the|files|file|documents|document|resumes|resume|cvs|cv|pdf|with|containing|contains|inside|mentioning|mentions|whose|content|text|in|inside|from|on|my|pc|computer|laptop|desktop|downloads|pictures|videos)\b/gi, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+          : intent.query;
+
+        await searchFiles(
+          wantsContent && contentQuery ? contentQuery : intent.query,
+          wantsContent,
+          intent.folder,
+        );
         return;
       }
 
-      // Search inside file contents.
+      // Send a command to the existing PC command handler.
+      // The backend decides which supported action to execute.
+      const data = await requestJSON(`${API}/api/agent/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: input }),
+      });
+
+      const obj = asObject(data);
+      const resultData = asObject(obj?.result);
+
+      const action =
+        typeof obj?.action === 'string' ? obj.action : '';
+
+      const backendMessage =
+        typeof obj?.message === 'string'
+          ? obj.message
+          : typeof obj?.detail === 'string'
+            ? obj.detail
+            : typeof resultData?.message === 'string'
+              ? resultData.message
+              : '';
+
+      // Content search results.
       if (intent.type === 'content') {
-        const data = await requestJSON(`${API}/api/agent/command`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ command: input }),
-        });
-
-        const obj = asObject(data);
-        const resultData = asObject(obj?.result);
-
         const rawResults = Array.isArray(obj?.results)
           ? obj.results
           : Array.isArray(resultData?.results)
             ? resultData.results
-            : [];
+            : Array.isArray(resultData?.matches)
+              ? resultData.matches
+              : [];
 
         const files = rawResults
           .filter(
@@ -1734,7 +1777,8 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
           message:
             files.length > 0
               ? `Found ${files.length} matching files.`
-              : getResultMessage(
+              : backendMessage ||
+              getResultMessage(
                 data,
                 'No files matched the requested content.',
               ),
@@ -1747,16 +1791,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
 
       // Open a file or folder.
       if (intent.type === 'open') {
-        const data = await requestJSON(`${API}/api/agent/command`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ command: input }),
-        });
-
-        const obj = asObject(data);
-        const action = obj?.action;
         const selection = asObject(obj?.selection);
-        const resultData = asObject(obj?.result);
 
         const openedActions = [
           'open_file_by_content',
@@ -1765,16 +1800,15 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
           'open_latest_screenshot',
         ];
 
-        if (
-          typeof action === 'string' &&
-          openedActions.includes(action)
-        ) {
+        if (openedActions.includes(action)) {
           setResult({
             title: 'File opened',
-            message: getResultMessage(
-              data,
-              'Open request sent to the default application.',
-            ),
+            message:
+              backendMessage ||
+              getResultMessage(
+                data,
+                'Open request sent to the default application.',
+              ),
             details:
               typeof selection?.path === 'string'
                 ? selection.path
@@ -1788,7 +1822,9 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
             ? obj.results
             : Array.isArray(resultData?.results)
               ? resultData.results
-              : [];
+              : Array.isArray(resultData?.matches)
+                ? resultData.matches
+                : [];
 
           const files = rawResults
             .filter(
@@ -1802,14 +1838,17 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
             .filter((file) => file.name && file.path);
 
           setResult({
-            title: 'Content search results',
+            title: files.length
+              ? 'Select a file'
+              : 'Open file result',
             message:
-              files.length > 0
+              backendMessage ||
+              (files.length > 0
                 ? 'Multiple files matched. Review the results before opening one.'
                 : getResultMessage(
                   data,
-                  'No matching file content was found. Try a more specific phrase.',
-                ),
+                  'No matching file was found. Try a more specific filename.',
+                )),
             files,
             data,
           });
@@ -1818,41 +1857,35 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
         return;
       }
 
-      // PC status.
+      // PC status: support the existing dedicated endpoint.
       if (intent.type === 'system') {
-        const data = await requestJSON(`${API}/api/agent/system`);
-
         setResult({
           title: 'PC status',
-          message: getResultMessage(
-            data,
-            'System information retrieved.',
-          ),
+          message:
+            backendMessage ||
+            getResultMessage(data, 'System information retrieved.'),
           data,
         });
 
         return;
       }
 
-      // Other requests: use the local Ollama conversational assistant.
-      const chatData = asObject(
-        await requestJSON(`${API}/api/agent/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: input,
-            history: [],
-          }),
-        }),
-      );
-
+      // All other requests: show the action or conversational response
+      // returned by the command handler.
       setResult({
-        title: 'VANTEX',
+        title:
+          action === 'clarify'
+            ? 'Need more details'
+            : action === 'chat'
+              ? 'VANTEX'
+              : 'VANTEX command result',
         message:
-          typeof chatData?.reply === 'string'
-            ? chatData.reply
-            : 'I could not generate a response.',
-        data: chatData,
+          backendMessage ||
+          getResultMessage(
+            data,
+            'Command processed. Check the result below.',
+          ),
+        data,
       });
     } catch (err) {
       setError(
@@ -1869,7 +1902,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
 
 
   const systemData = asObject(result?.data);
-  const metricsData = asObject(systemData?.system);
+  const metricsData = asObject(asObject(systemData?.result)?.system) ?? asObject(systemData?.system);
 
   const systemEntries = metricsData
     ? Object.entries(metricsData).filter(

@@ -7,9 +7,12 @@ from pydantic import BaseModel, HttpUrl
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from pathlib import Path
 from fastapi import Query
+import base64
+import re
 import difflib
 import hashlib
 import secrets
+from ai.pc_apps import discover_apps, launch_app
 from datetime import datetime, timezone
 app = FastAPI(
     title="VANTEX API",
@@ -67,6 +70,8 @@ def get_system_status():
 async def test_website(request: WebsiteTestRequest):
     from collections import deque
     from urllib.parse import urldefrag, urlunparse
+    import xml.etree.ElementTree as ET
+    import re
 
     start_url = str(request.url)
     parsed_start = urlparse(start_url)
@@ -104,12 +109,154 @@ async def test_website(request: WebsiteTestRequest):
     max_links_per_page = 100
     max_external_checks = 50
 
+    discovered_urls = {start_url}
+
+    async def discover_sitemap_urls(request_context, base_url):
+        """Discover same-origin URLs through robots.txt and XML sitemaps."""
+        origin = urlparse(base_url)
+        robots_url = f"{origin.scheme}://{origin.netloc}/robots.txt"
+        sitemap_queue = []
+        found_pages = set()
+
+        try:
+            response = await request_context.get(
+                robots_url, timeout=7000, fail_on_status_code=False
+            )
+            if response.status < 400:
+                robots_text = await response.text()
+                for line in robots_text.splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key.strip().lower() == "sitemap":
+                        candidate = normalize_url(value.strip())
+                        if candidate and same_origin(base_url, candidate):
+                            sitemap_queue.append(candidate)
+        except Exception:
+            pass
+
+        # Standard fallback for sites that do not declare a sitemap in robots.txt.
+        fallback = normalize_url(urljoin(base_url, "/sitemap.xml"))
+        if fallback and fallback not in sitemap_queue:
+            sitemap_queue.append(fallback)
+
+        seen_sitemaps = set()
+        max_sitemaps = 10
+
+        while sitemap_queue and len(seen_sitemaps) < max_sitemaps:
+            sitemap_url = sitemap_queue.pop(0)
+            if sitemap_url in seen_sitemaps:
+                continue
+            seen_sitemaps.add(sitemap_url)
+
+            try:
+                response = await request_context.get(
+                    sitemap_url, timeout=7000, fail_on_status_code=False
+                )
+                if response.status >= 400:
+                    continue
+
+                body = await response.text()
+                if len(body) > 5_000_000:
+                    continue
+
+                root = ET.fromstring(body)
+                for element in root.iter():
+                    if element.tag.rsplit("}", 1)[-1].lower() != "loc":
+                        continue
+
+                    value = (element.text or "").strip()
+                    candidate = normalize_url(urljoin(sitemap_url, value))
+                    if not candidate or not same_origin(base_url, candidate):
+                        continue
+
+                    # Sitemap indexes contain sitemap URLs; ordinary sitemaps
+                    # contain page URLs. Both are handled without fixed routes.
+                    if candidate.lower().endswith(".xml"):
+                        if candidate not in seen_sitemaps:
+                            sitemap_queue.append(candidate)
+                    else:
+                        found_pages.add(candidate)
+
+                    if len(found_pages) >= 2000:
+                        return found_pages
+            except Exception:
+                continue
+
+        return found_pages
+
+    async def discover_bundle_routes(page, request_context, base_url):
+        """Discover static SPA route candidates from same-origin JS bundles."""
+        candidates = set()
+
+        try:
+            script_urls = await page.locator("script[src]").evaluate_all(
+                "els => els.map(el => el.src).filter(Boolean)"
+            )
+        except Exception:
+            return candidates
+
+        for script_url in script_urls[:20]:
+            normalized_script = normalize_url(script_url)
+            if not normalized_script or not same_origin(base_url, normalized_script):
+                continue
+
+            try:
+                response = await request_context.get(
+                    normalized_script, timeout=10000, fail_on_status_code=False
+                )
+                if response.status >= 400:
+                    continue
+
+                body = await response.text()
+                if len(body) > 5_000_000:
+                    continue
+
+                patterns = [
+                    r'path\s*:\s*`([^`]+)`',
+                    r'path\s*:\s*"([^"]+)"',
+                    r"path\s*:\s*'([^']+)'",
+                ]
+
+                for pattern in patterns:
+                    for match in re.finditer(pattern, body):
+                        route = match.group(1).strip()
+
+                        # Keep only literal absolute route paths.
+                        if (
+                            not route.startswith("/")
+                            or route.startswith("//")
+                            or len(route) > 150
+                            or any(c in route for c in (" ", "\n", "<", ">"))
+                            or any(c in route for c in (":", "*", "{", "}"))
+                        ):
+                            continue
+
+                        candidate = normalize_url(urljoin(base_url, route))
+                        if candidate and same_origin(base_url, candidate):
+                            candidates.add(candidate)
+
+            except Exception:
+                continue
+
+        return candidates
+
     browser = None
 
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             context = await browser.new_context(ignore_https_errors=False)
+
+            sitemap_urls = await discover_sitemap_urls(
+                context.request, start_url
+            )
+            discovered_urls.update(sitemap_urls)
+
+            for sitemap_url in sorted(sitemap_urls):
+                if len(queued) >= max_pages:
+                    break
+                if sitemap_url not in queued:
+                    queued.add(sitemap_url)
+                    queue.append((sitemap_url, 1))
 
             while queue and len(visited) < max_pages:
                 current_url, depth = queue.popleft()
@@ -131,6 +278,7 @@ async def test_website(request: WebsiteTestRequest):
                     "broken_links": [],
                     "links_checked": 0,
                     "responsive_checks": [],
+                    "ui_audit": [],
                     "summary": {},
                 }
 
@@ -181,8 +329,35 @@ async def test_website(request: WebsiteTestRequest):
                     page_result["http_status"] = (
                         response.status if response else None
                     )
+
+                    requested_url = normalize_url(current_url)
+                    final_url = normalize_url(page.url)
+                    redirected = bool(
+                        requested_url and final_url and requested_url != final_url
+                    )
+
+                    # A redirected route is authentication-required only when the
+                    # destination looks like a login form. The login page itself
+                    # is not classified as protected just because it has a password.
+                    has_password_field = await page.locator(
+                        'input[type="password"]'
+                    ).count() > 0
+                    has_login_field = await page.locator(
+                        'input[type="email"], input[autocomplete="username"], '
+                        'input[name*="email" i], input[name*="user" i]'
+                    ).count() > 0
+
+                    page_result["auth_required"] = bool(
+                        redirected and has_password_field and has_login_field
+                    )
+                    page_result["status"] = (
+                        "AUTH_REQUIRED" if page_result["auth_required"]
+                        else "TESTED"
+                    )
                     page_result["success"] = bool(
-                        response and response.status < 400
+                        response
+                        and response.status < 400
+                        and not page_result["auth_required"]
                     )
 
                     # Discover links on this page. Only same-origin links enter
@@ -197,6 +372,7 @@ async def test_website(request: WebsiteTestRequest):
                             continue
 
                         if same_origin(start_url, normalized):
+                            discovered_urls.add(normalized)
                             if normalized not in visited:
                                 discovered_internal.add(normalized)
                         else:
@@ -205,6 +381,14 @@ async def test_website(request: WebsiteTestRequest):
                     page_result["links_checked"] = min(
                         len(raw_links), max_links_per_page
                     )
+
+                    # Discover static SPA route candidates from same-origin bundles.
+                    # These are candidates, not proof that a page is accessible.
+                    bundle_routes = await discover_bundle_routes(
+                        page, context.request, start_url
+                    )
+                    discovered_urls.update(bundle_routes)
+                    discovered_internal.update(bundle_routes)
 
                     # Responsive horizontal-overflow checks.
                     viewports = [
@@ -218,7 +402,287 @@ async def test_website(request: WebsiteTestRequest):
                             "width": viewport["width"],
                             "height": viewport["height"],
                         })
-                        await page.wait_for_timeout(150)
+                        await page.wait_for_timeout(250)
+
+                        ui_audit = await page.evaluate("""() => {
+                            const issues = [];
+                            const seen = new Set();
+
+                            function add(category, severity, el, evidence,
+                                         recommendation, confidence = "high") {
+                                const key = category + "|" + selector(el) + "|" + evidence;
+                                if (seen.has(key) || issues.length >= 60) return;
+                                seen.add(key);
+
+                                const text = (el.innerText || el.value || "")
+                                    .replace(/\s+/g, " ").trim().slice(0, 100);
+
+                                issues.push({
+                                    category,
+                                    severity,
+                                    element: selector(el),
+                                    element_text: text,
+                                    evidence,
+                                    recommendation,
+                                    confidence
+                                });
+                            }
+
+                            function visible(el) {
+                                const r = el.getBoundingClientRect();
+                                const s = getComputedStyle(el);
+                                return r.width > 0 && r.height > 0 &&
+                                    s.display !== "none" &&
+                                    s.visibility !== "hidden" &&
+                                    Number(s.opacity) > 0;
+                            }
+
+                            function selector(el) {
+                                const tag = el.tagName.toLowerCase();
+                                if (el.id) return tag + "#" + el.id;
+
+                                const classes = typeof el.className === "string"
+                                    ? el.className.trim().split(/\s+/)
+                                        .filter(Boolean).slice(0, 2)
+                                    : [];
+
+                                let result = tag + classes.map(c => "." + c).join("");
+
+                                if (!classes.length && el.parentElement) {
+                                    const siblings = [...el.parentElement.children]
+                                        .filter(n => n.tagName === el.tagName);
+                                    if (siblings.length > 1) {
+                                        result += ":nth-of-type(" +
+                                            (siblings.indexOf(el) + 1) + ")";
+                                    }
+                                }
+
+                                return result.slice(0, 160);
+                            }
+
+                            function accessibleName(el) {
+                                const labelledBy = el.getAttribute("aria-labelledby");
+                                const referencedText = labelledBy
+                                    ? labelledBy.split(/\s+/)
+                                        .map(id => document.getElementById(id)?.innerText || "")
+                                        .join(" ")
+                                    : "";
+
+                                const label = el.labels
+                                    ? [...el.labels].map(x => x.innerText).join(" ")
+                                    : "";
+
+                                return (
+                                    el.getAttribute("aria-label") ||
+                                    referencedText ||
+                                    label ||
+                                    el.getAttribute("title") ||
+                                    el.innerText ||
+                                    el.value ||
+                                    el.querySelector("img[alt]")?.getAttribute("alt") ||
+                                    ""
+                                ).trim();
+                            }
+
+                            function rgb(value) {
+                                if (!value || value === "transparent") return null;
+                                const m = value.match(
+                                    /rgba?\(\s*(\d+(?:\.\d+)?)\s*[, ]\s*(\d+(?:\.\d+)?)\s*[, ]\s*(\d+(?:\.\d+)?)(?:\s*[,/]\s*([\d.]+))?\s*\)/
+                                );
+                                if (!m) return null;
+
+                                const alpha = m[4] === undefined ? 1 : Number(m[4]);
+                                if (alpha < 0.999) return null;
+
+                                return [+m[1], +m[2], +m[3]];
+                            }
+
+                            function luminance(color) {
+                                const values = color.map(v => {
+                                    v /= 255;
+                                    return v <= 0.04045
+                                        ? v / 12.92
+                                        : Math.pow((v + 0.055) / 1.055, 2.4);
+                                });
+
+                                return 0.2126 * values[0] +
+                                    0.7152 * values[1] +
+                                    0.0722 * values[2];
+                            }
+
+                            function solidBackground(el) {
+                                let node = el;
+
+                                while (node && node.nodeType === 1) {
+                                    const style = getComputedStyle(node);
+
+                                    // Do not guess a color when gradients or background
+                                    // images may affect the actual rendered background.
+                                    if (style.backgroundImage &&
+                                        style.backgroundImage !== "none") {
+                                        return null;
+                                    }
+
+                                    const value = style.backgroundColor;
+                                    const color = rgb(value);
+
+                                    if (color) return color;
+
+                                    if (value && value.startsWith("rgba(")) {
+                                        const alpha = Number(
+                                            value.match(/,\s*([\d.]+)\s*\)$/)?.[1] ?? 0
+                                        );
+                                        if (alpha > 0) return null;
+                                    }
+
+                                    node = node.parentElement;
+                                }
+
+                                return [255, 255, 255];
+                            }
+
+                            const elements = [...document.querySelectorAll("body *")]
+                                .filter(visible);
+
+                            for (const el of elements) {
+                                const tag = el.tagName.toLowerCase();
+                                const style = getComputedStyle(el);
+                                const text = (el.innerText || "").trim();
+                                const fontSize = parseFloat(style.fontSize);
+
+                                // Only flag very small, non-trivial text. Tiny decorative
+                                // separators and short metadata labels are often intentional.
+                                if (
+                                    el.children.length === 0 &&
+                                    text.length >= 24 &&
+                                    fontSize > 0 &&
+                                    fontSize < 10 &&
+                                    style.textTransform !== "uppercase"
+                                ) {
+                                    add(
+                                        "Typography", "low", el,
+                                        "Text is " + fontSize +
+                                            "px and contains " + text.length + " characters.",
+                                        "Review this text at the current viewport. If it is important reading content, consider a font size of at least 12px; otherwise mark intentional microcopy as an exception.",
+                                        "medium"
+                                    );
+                                }
+
+                                // Detect measurable horizontal clipping.
+                                if (
+                                    ["hidden", "clip"].includes(style.overflowX) &&
+                                    el.scrollWidth > el.clientWidth + 3 &&
+                                    el.clientWidth > 0 &&
+                                    text.length > 0
+                                ) {
+                                    add(
+                                        "Typography", "medium", el,
+                                        "Content width is " + el.scrollWidth +
+                                            "px but visible width is " + el.clientWidth + "px.",
+                                        "Check whether text should wrap, the container should grow, or truncation should be explicitly indicated.",
+                                        "high"
+                                    );
+                                }
+
+                                // Estimate contrast only when a solid background can be
+                                // identified; skip uncertain backgrounds instead of guessing.
+                                if (
+                                    el.children.length === 0 &&
+                                    text.length > 0 &&
+                                    fontSize >= 1
+                                ) {
+                                    const foreground = rgb(style.color);
+                                    const background = solidBackground(el);
+
+                                    if (foreground && background) {
+                                        const a = luminance(foreground);
+                                        const b = luminance(background);
+                                        const ratio = (Math.max(a, b) + 0.05) /
+                                            (Math.min(a, b) + 0.05);
+                                        const bold = parseInt(style.fontWeight, 10) >= 700;
+                                        const large = fontSize >= (bold ? 18.66 : 24);
+                                        const required = large ? 3 : 4.5;
+
+                                        if (ratio < required) {
+                                            add(
+                                                "Color & contrast", "medium", el,
+                                                "Estimated contrast is " + ratio.toFixed(2) +
+                                                    ":1; WCAG AA target is " + required + ":1.",
+                                                "Increase the contrast between this text and its background. Recheck the final rendered colors, especially if opacity or overlays are used.",
+                                                "medium"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Accessible names for interactive controls.
+                                if (
+                                    (tag === "button" ||
+                                     (tag === "a" && el.hasAttribute("href")) ||
+                                     (tag === "input" &&
+                                      !["hidden", "submit", "button", "reset"].includes(el.type))) &&
+                                    !accessibleName(el)
+                                ) {
+                                    add(
+                                        "Accessibility", "high", el,
+                                        "No accessible name was detected for this interactive control.",
+                                        "Provide visible text, an associated label, or a valid aria-label/aria-labelledby reference.",
+                                        "high"
+                                    );
+                                }
+
+                                if (
+                                    tag === "input" &&
+                                    !["hidden", "submit", "button", "reset", "image"].includes(el.type) &&
+                                    !el.labels?.length &&
+                                    !el.getAttribute("aria-label") &&
+                                    !el.getAttribute("aria-labelledby")
+                                ) {
+                                    add(
+                                        "Accessibility", "medium", el,
+                                        "Input has no associated label or ARIA naming attribute.",
+                                        "Associate a visible label with this input, or provide an appropriate accessible name.",
+                                        "high"
+                                    );
+                                }
+                            }
+
+                            // Check control consistency only within forms that have
+                            // at least two visible controls.
+                            for (const form of document.querySelectorAll("form")) {
+                                const controls = [...form.querySelectorAll(
+                                    "input:not([type=hidden]), select, textarea, button"
+                                )].filter(visible);
+
+                                if (controls.length < 2) continue;
+
+                                const heights = controls.map(el =>
+                                    el.getBoundingClientRect().height
+                                );
+                                const spread = Math.max(...heights) - Math.min(...heights);
+
+                                if (spread > 8) {
+                                    add(
+                                        "Alignment & spacing", "low", form,
+                                        "Form control heights vary by " +
+                                            Math.round(spread) + "px.",
+                                        "Review whether these controls serve similar purposes. If so, align their heights through shared component styles.",
+                                        "medium"
+                                    );
+                                }
+                            }
+
+                            return {
+                                viewport_width: document.documentElement.clientWidth,
+                                viewport_height: window.innerHeight,
+                                issues
+                            };
+                        }""")
+
+                        page_result["ui_audit"].append({
+                            **viewport,
+                            **ui_audit
+                        })
 
                         layout = await page.evaluate("""() => {
                             const viewportWidth =
@@ -283,6 +747,10 @@ async def test_website(request: WebsiteTestRequest):
                         1 for item in page_result["responsive_checks"]
                         if not item["passed"]
                     ),
+                    "ui_issue_count": sum(
+                        len(item.get("issues", []))
+                        for item in page_result["ui_audit"]
+                    ),
                 }
                 pages.append(page_result)
 
@@ -325,7 +793,10 @@ async def test_website(request: WebsiteTestRequest):
             item["summary"].get("responsive_viewports_failed", 0)
             for item in pages
         )
-        failed_pages = sum(1 for p in pages if not p["success"])
+        failed_pages = sum(
+            1 for p in pages
+            if not p["success"] and not p.get("auth_required")
+        )
 
         # Keep legacy fields for the existing frontend, and provide the
         # detailed per-page report alongside them.
@@ -344,13 +815,19 @@ async def test_website(request: WebsiteTestRequest):
             "responsive_checks": first.get("responsive_checks", []),
             "pages": pages,
             "external_links": external_results,
-            "pages_discovered": len(queued),
+            "pages_discovered": len(discovered_urls),
             "pages_tested": len(pages),
+            "pages_auth_required": sum(
+                1 for p in pages if p.get("auth_required")
+            ),
             "pages_failed": failed_pages,
             "crawl_limit": max_pages,
             "summary": {
                 "pages_tested": len(pages),
                 "pages_failed": failed_pages,
+                "pages_auth_required": sum(
+                    1 for p in pages if p.get("auth_required")
+                ),
                 "console_error_count": total_console_errors,
                 "page_error_count": total_page_errors,
                 "failed_request_count": total_failed_requests,
@@ -362,12 +839,19 @@ async def test_website(request: WebsiteTestRequest):
                     len(p["responsive_checks"]) for p in pages
                 ),
                 "responsive_viewports_failed": total_responsive_failed,
+                "ui_issue_count": sum(
+                    len(item.get("issues", []))
+                    for page in pages
+                    for item in page.get("ui_audit", [])
+                ),
             },
             "note": (
-                "Only discoverable same-origin links are crawled, up to 50 pages "
-                "and depth 5. External links are checked separately, up to 50. "
-                "Responsive checks detect horizontal overflow, not every visual "
-                "defect. No source files were modified."
+                "Pages are discovered from rendered same-origin links and "
+                "robots.txt/XML sitemaps. Crawl limits are currently 50 pages "
+                "and depth 5; up to 50 external links are checked separately. "
+                "Hidden routes, login-protected pages and button-only navigation "
+                "may require additional discovery or an authorized login session. "
+                "Responsive checks detect horizontal overflow, not every visual defect."
             ),
         }
 
@@ -387,6 +871,161 @@ async def test_website(request: WebsiteTestRequest):
 import os
 
 AGENT_ROOT = (Path.home() / "Desktop" / "VANTEX").resolve()
+
+SELECTED_PROJECT_ROOT = AGENT_ROOT
+PROJECT_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".turbo"}
+PROJECT_TEXT_EXTENSIONS = {".html", ".css", ".scss", ".sass", ".less", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".json", ".py", ".md", ".yaml", ".yml"}
+
+
+class ProjectSelectRequest(BaseModel):
+    path: str
+
+
+def _describe_project(root: Path) -> dict:
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        raise HTTPException(status_code=400, detail="Choose an existing, non-symlink project folder.")
+    root = root.resolve(strict=True)
+
+    # Recognize ordinary projects and monorepo roots; never scan dependencies/build output.
+    direct = {
+        "package.json": (root / "package.json").is_file(),
+        "index.html": (root / "index.html").is_file(),
+        "pyproject.toml": (root / "pyproject.toml").is_file(),
+        "requirements.txt": (root / "requirements.txt").is_file(),
+        "src": (root / "src").is_dir(),
+        "app": (root / "app").is_dir(),
+        "pages": (root / "pages").is_dir(),
+        "main.py": (root / "main.py").is_file(),
+        "manage.py": (root / "manage.py").is_file(),
+    }
+    nested_markers = []
+    skip_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".turbo"}
+    for base, dirs, files in os.walk(root, followlinks=False):
+        relative = Path(base).relative_to(root)
+        depth = len(relative.parts)
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not (Path(base) / d).is_symlink()]
+        if depth >= 3:
+            dirs[:] = []
+            continue
+        if any(name in files for name in ("package.json", "index.html", "pyproject.toml", "requirements.txt", "main.py", "manage.py")):
+            nested_markers.append(Path(base))
+    has_monorepo_layout = any((root / name).is_dir() for name in ("apps", "packages", "frontend", "backend", "client", "server", "web", "api", "ai"))
+    if not any(direct.values()) and not nested_markers and not has_monorepo_layout:
+        raise HTTPException(status_code=400, detail="Folder does not look like a source project. Choose a project folder containing source files, or a monorepo root with apps/, packages/, frontend/, backend/, client/, server/, web/, api/, or ai/.")
+
+    package_file = root / "package.json"
+    if not package_file.is_file():
+        package_file = next((p / "package.json" for p in nested_markers if (p / "package.json").is_file()), None)
+    indicators = {**direct, "nested_project_files": bool(nested_markers), "monorepo_layout": has_monorepo_layout}
+    framework = "Project / monorepo"
+    if package_file and package_file.is_file():
+        try:
+            import json
+            pkg = json.loads(package_file.read_text(encoding="utf-8"))
+            deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+            framework = next((name for key, name in [("vite", "Vite"), ("next", "Next.js"), ("react", "React"), ("vue", "Vue"), ("svelte", "Svelte")] if key in deps), "Node.js project")
+            if package_file.parent != root:
+                framework += " monorepo"
+        except Exception:
+            framework = "Node.js project / monorepo"
+    elif direct["pyproject.toml"] or direct["requirements.txt"] or direct["main.py"] or direct["manage.py"] or any((p / "main.py").is_file() for p in nested_markers):
+        framework = "Python project / monorepo"
+    elif direct["index.html"]:
+        framework = "Static HTML"
+    return {"path": str(root), "name": root.name, "framework": framework, "indicators": indicators}
+
+
+@app.get("/api/projects/current")
+def current_project():
+    return {**_describe_project(SELECTED_PROJECT_ROOT), "selected": True}
+
+
+@app.post("/api/projects/select")
+def select_project(request: ProjectSelectRequest):
+    global SELECTED_PROJECT_ROOT
+    candidate = Path(request.path).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=400, detail="Enter an absolute project folder path.")
+    try:
+        candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="Project folder does not exist or cannot be accessed.")
+    info = _describe_project(candidate)
+    SELECTED_PROJECT_ROOT = candidate
+    return {**info, "selected": True, "message": "Project selected. Project-fix operations are scoped to this folder."}
+
+
+@app.get("/api/projects/browse")
+def browse_project():
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        chosen = filedialog.askdirectory(title="Choose a project folder", mustexist=True)
+        root.destroy()
+    except Exception as error:
+        raise HTTPException(status_code=501, detail=f"Native folder picker unavailable ({str(error)[:100]}). Enter the absolute path manually.") from error
+    if not chosen:
+        return {"cancelled": True, "message": "Folder selection cancelled."}
+    return {**_describe_project(Path(chosen)), "selected": False}
+
+
+def resolve_selected_project_path(raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = SELECTED_PROJECT_ROOT / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(SELECTED_PROJECT_ROOT.resolve(strict=True))
+    except (ValueError, OSError, RuntimeError):
+        raise HTTPException(status_code=403, detail="Access denied: path is outside the selected project or does not exist.")
+    return resolved
+
+
+@app.get("/api/projects/map-source")
+def map_project_source(selector: str = Query(min_length=1, max_length=500)):
+    root = SELECTED_PROJECT_ROOT.resolve(strict=True)
+    tokens = []
+    if "#" in selector:
+        token = selector.split("#", 1)[1].split(".", 1)[0].split(":", 1)[0].split(" ", 1)[0]
+        if token and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", token):
+            tokens.append(token)
+    tokens.extend(re.findall(r"\.([A-Za-z_][A-Za-z0-9_-]*)", selector))
+    tokens = list(dict.fromkeys(tokens))
+    if not tokens:
+        raise HTTPException(status_code=400, detail="Selector has no safe class or id token to map.")
+    matches = []
+    scanned = 0
+    for current, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in PROJECT_SKIP_DIRS and not (Path(current) / d).is_symlink()]
+        for filename in files:
+            path = Path(current) / filename
+            if path.suffix.lower() not in PROJECT_TEXT_EXTENSIONS or path.is_symlink():
+                continue
+            scanned += 1
+            if scanned > 6000:
+                break
+            try:
+                if path.stat().st_size > 1000000:
+                    continue
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            found = [token for token in tokens if re.search(r"(?<![A-Za-z0-9_-])" + re.escape(token) + r"(?![A-Za-z0-9_-])", content)]
+            if found:
+                matches.append({"path": str(path.resolve()), "relative_path": str(path.resolve().relative_to(root)), "type": "style" if path.suffix.lower() in {".css", ".scss", ".sass", ".less"} else "source", "matched_tokens": found})
+                if len(matches) >= 40:
+                    break
+        if scanned > 6000 or len(matches) >= 40:
+            break
+    return {"project": str(root), "selector": selector, "tokens": tokens, "matches": matches, "message": "These are heuristic source candidates, not guaranteed ownership of the rendered element."}
+
+
 MAX_READ_BYTES = 1_000_000
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", "dist", "build"}
 
@@ -563,7 +1202,10 @@ PENDING_EDITS = {}
 
 @app.post("/api/agent/files/prepare-edit")
 def prepare_file_edit(request: PrepareEditRequest):
-    target = resolve_agent_path(request.path)
+    try:
+        target = resolve_agent_path(request.path)
+    except HTTPException:
+        target = resolve_selected_project_path(request.path)
 
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Target must be an existing file.")
@@ -618,6 +1260,435 @@ def prepare_file_edit(request: PrepareEditRequest):
     }
 
 
+
+# VANTEX_MULTI_FIX_V1
+class UIFixRequest(BaseModel):
+    element: str = Field(min_length=1, max_length=500)
+    evidence: str = Field(min_length=1, max_length=300)
+    category: str = Field(default="Typography", max_length=80)
+    fix_kind: str = Field(default="typography", max_length=30)
+    accessibility_label: str = Field(default="", max_length=120)
+    contrast_color: str = Field(default="#ffffff", max_length=20)
+
+
+def _ui_fix_declarations(fix_kind: str, contrast_color: str = "#ffffff") -> dict[str, str]:
+    """Only return predefined CSS values; never accept arbitrary CSS from the client."""
+    if fix_kind == "typography":
+        return {"font-size": "12px"}
+    if fix_kind == "overflow":
+        return {
+            "max-width": "100%",
+            "min-width": "0",
+            "overflow-wrap": "anywhere",
+            "white-space": "normal",
+        }
+    if fix_kind == "contrast":
+        # Only accept one of two predefined high-contrast foreground choices.
+        color = contrast_color.lower()
+        if color not in {"#ffffff", "#111827"}:
+            color = "#ffffff"
+        return {"color": color}
+    raise HTTPException(status_code=400, detail="Unsupported UI fix type.")
+
+
+def _prepare_accessibility_input_edit(project_root: Path, selector: str, requested_label: str = ""):
+    """Prepare an aria-label proposal only when exactly one matching JSX input is found."""
+    tokens = list(dict.fromkeys(re.findall(r"\.([A-Za-z_][A-Za-z0-9_-]*)", selector)))
+    if not tokens:
+        raise HTTPException(status_code=422, detail="Could not identify input classes from this finding. Use Find source file.")
+
+    matches = []
+    scanned = 0
+    skip = set(PROJECT_SKIP_DIRS) | {"dist", "build", ".next", ".git", "coverage"}
+    for current, dirs, files in os.walk(project_root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in skip and not (Path(current) / d).is_symlink()]
+        for filename in files:
+            candidate = Path(current) / filename
+            if candidate.suffix.lower() not in {".tsx", ".jsx", ".html", ".vue", ".svelte"} or candidate.is_symlink():
+                continue
+            scanned += 1
+            if scanned > 2500:
+                break
+            try:
+                if candidate.stat().st_size > 1_000_000:
+                    continue
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for tag_match in re.finditer(r"<input\b[^>]*>", content, flags=re.IGNORECASE | re.DOTALL):
+                tag = tag_match.group(0)
+                class_match = re.search(r"(?:className|class)\s*=\s*(?:\{\s*)?['\"]([^'\"]*)['\"]", tag)
+                if not class_match:
+                    continue
+                classes = set(class_match.group(1).split())
+                if not set(tokens).issubset(classes):
+                    continue
+                if re.search(r"\b(?:aria-label|aria-labelledby)\s*=", tag):
+                    continue
+                # An associated explicit label may be outside this tag; the QA report says none,
+                # but only propose if the control has a meaningful placeholder/name/type.
+                placeholder = re.search(r"\bplaceholder\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I)
+                name = re.search(r"\bname\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I)
+                input_type = re.search(r"\btype\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I)
+                identifier = re.search(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", tag, re.I)
+                label = placeholder.group(1).strip() if placeholder else ""
+                if not label and name:
+                    raw = name.group(1).replace("_", " ").replace("-", " ").strip()
+                    label = raw[:1].upper() + raw[1:]
+                if not label and identifier:
+                    raw = identifier.group(1).replace("_", " ").replace("-", " ").strip()
+                    label = raw[:1].upper() + raw[1:]
+                if not label and input_type:
+                    label = {"email": "Email address", "password": "Password", "search": "Search", "tel": "Phone number", "url": "Website address", "number": "Number"}.get(input_type.group(1).lower(), "")
+                if not label:
+                    label = requested_label.strip()
+                if not label:
+                    # Keep this input out of automatic edits unless the user supplies a meaningful label.
+                    continue
+                matches.append((candidate.resolve(), content, tag_match.start(), tag_match.end(), tag, label))
+        if scanned > 2500:
+            break
+
+    # De-duplicate the same physical source range and never guess between repeated controls.
+    unique = {(str(item[0]), item[2], item[3]): item for item in matches}
+    matches = list(unique.values())
+    if len(matches) != 1:
+        detail = "No safely identifiable input with a meaningful placeholder/name was found." if not matches else f"Found {len(matches)} matching inputs; refusing to guess which one to edit."
+        raise HTTPException(status_code=422, detail=detail + " Use Find source file and add a visible label or aria-label manually.")
+
+    target, original, start, end, tag, label = matches[0]
+    try:
+        target.relative_to(project_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Input source is outside the selected project.")
+    escaped = label.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+    replacement = re.sub(r"\s*/?>$", lambda m: f' aria-label="{escaped}"{m.group(0)}', tag)
+    proposed = original[:start] + replacement + original[end:]
+    result = prepare_file_edit(PrepareEditRequest(path=str(target), new_content=proposed))
+    if not result.get("changed"):
+        raise HTTPException(status_code=409, detail="No accessibility change was proposed.")
+    result["fix_type"] = "accessibility"
+    result["proposed_declarations"] = {"aria-label": label}
+    result["caution"] = "Review the source diff. This adds an accessible name based on the input's existing placeholder/name/id; a visible label is preferable when practical."
+    return result
+
+
+# VANTEX_ACCESSIBILITY_FIX_V1
+# VANTEX_QA_PROPOSAL_REPAIR_V1
+
+@app.post("/api/agent/qa/prepare-ui-fix")
+def prepare_ui_fix(request: UIFixRequest):
+    selector = request.element.strip()
+    if not selector or len(selector) > 500 or any(char in selector for char in "{};"):
+        raise HTTPException(status_code=400, detail="Unsupported CSS selector.")
+
+    fix_kind = request.fix_kind.strip().lower()
+    evidence = request.evidence.strip()
+    if fix_kind == "typography":
+        match = re.fullmatch(
+            r"Text is ([0-9]+(?:\.[0-9]+)?)px and contains [0-9]+ characters\.",
+            evidence,
+        )
+        if request.category != "Typography" or not match or float(match.group(1)) >= 10:
+            raise HTTPException(status_code=400, detail="Typography fixes require evidence of text smaller than 10px.")
+    elif fix_kind == "overflow":
+        if request.category != "Typography" or not evidence.startswith("Content width is "):
+            raise HTTPException(status_code=400, detail="Overflow fixes require a measured content-width finding.")
+    elif fix_kind == "contrast":
+        if request.category != "Color & contrast" or not evidence.startswith("Estimated contrast is "):
+            raise HTTPException(status_code=400, detail="Contrast fixes require a color-contrast finding.")
+    elif fix_kind == "accessibility":
+        evidence_lower = evidence.lower()
+        if not ("accessible name" in evidence_lower or "associated label" in evidence_lower or "aria naming attribute" in evidence_lower):
+            raise HTTPException(status_code=400, detail="Accessibility fixes require a missing input-name/label finding.")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported UI fix type.")
+
+    project_root = SELECTED_PROJECT_ROOT.resolve(strict=True)
+    if fix_kind == "accessibility":
+        return _prepare_accessibility_input_edit(project_root, selector, request.accessibility_label)
+
+    declarations = _ui_fix_declarations(
+        fix_kind,
+        request.contrast_color if request.contrast_color in {"#ffffff", "#111827"} else "#ffffff",
+    )
+    tokens = []
+    if "#" in selector:
+        token = selector.split("#", 1)[1].split(".", 1)[0].split(":", 1)[0].split(" ", 1)[0]
+        if token and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", token):
+            tokens.append(token)
+    tokens.extend(re.findall(r"\.([A-Za-z_][A-Za-z0-9_-]*)", selector))
+    tokens = list(dict.fromkeys(tokens))
+
+    style_files = []
+    scanned = 0
+    for current, dirs, files in os.walk(project_root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in PROJECT_SKIP_DIRS and not (Path(current) / d).is_symlink()]
+        for filename in files:
+            candidate = Path(current) / filename
+            if candidate.suffix.lower() not in {".css", ".scss", ".sass", ".less"} or candidate.is_symlink():
+                continue
+            scanned += 1
+            if scanned > 3000:
+                break
+            try:
+                if candidate.stat().st_size > 1_000_000:
+                    continue
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if tokens and any(
+                re.search(r"(?<![A-Za-z0-9_-])" + re.escape(token) + r"(?![A-Za-z0-9_-])", content)
+                for token in tokens
+            ):
+                style_files.append(candidate.resolve())
+                if len(style_files) >= 20:
+                    break
+        if scanned > 3000 or len(style_files) >= 20:
+            break
+
+    if style_files:
+        target = style_files[0]
+    else:
+        fallbacks = [
+            "src/index.css", "src/App.css", "src/globals.css", "src/style.css",
+            "app/globals.css", "app/styles.css", "styles/globals.css",
+            "index.css", "style.css", "apps/web/src/index.css", "apps/web/src/App.css",
+        ]
+        target = next((project_root / rel for rel in fallbacks if (project_root / rel).is_file()), None)
+        if target is None:
+            # Tailwind utility classes usually do not exist as selectors in source CSS.
+            # Find an existing source stylesheet recursively; never use dist/build output.
+            recursive_css = []
+            skip_css_dirs = set(PROJECT_SKIP_DIRS) | {"dist", "build", ".next", ".git", "coverage"}
+            for current, dirs, filenames in os.walk(project_root, followlinks=False):
+                dirs[:] = [d for d in dirs if d not in skip_css_dirs and not (Path(current) / d).is_symlink()]
+                for filename in filenames:
+                    candidate = Path(current) / filename
+                    if candidate.suffix.lower() not in {".css", ".scss", ".sass", ".less"} or candidate.is_symlink():
+                        continue
+                    try:
+                        if candidate.stat().st_size <= 1_000_000:
+                            recursive_css.append(candidate.resolve())
+                    except OSError:
+                        continue
+                if len(recursive_css) >= 80:
+                    break
+            preferred = {"globals.css": 0, "global.css": 1, "index.css": 2, "app.css": 3, "home.css": 4, "style.css": 5, "styles.css": 6}
+            recursive_css.sort(key=lambda p: (preferred.get(p.name.lower(), 20), len(p.parts), str(p)))
+            target = recursive_css[0] if recursive_css else None
+        if target is None:
+            raise HTTPException(status_code=404, detail="No source stylesheet exists in the selected project. Select the actual frontend project folder; no file changed.")
+        target = target.resolve(strict=True)
+
+    try:
+        target.relative_to(project_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Stylesheet is outside selected project.")
+    original = target.read_text(encoding="utf-8")
+    marker = f"/* VANTEX {fix_kind} proposal: {selector} */"
+    declaration_text = "\n".join(f"    {name}: {value} !important;" for name, value in declarations.items())
+    # VANTEX_QA_PROPOSAL_REPAIR_V1: escape Tailwind variant colons in class selectors.
+    css_selector = re.sub(
+        r"\.([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)+)",
+        lambda m: "." + m.group(1).replace(":", r"\:"),
+        selector,
+    )
+    new_block = marker + "\n" + css_selector + " {\n" + declaration_text + "\n}"
+    if marker in original:
+        # Update the existing VANTEX proposal in-place instead of blocking the user.
+        start = original.index(marker)
+        close = original.find("\n}", start)
+        if close < 0:
+            raise HTTPException(status_code=409, detail="Existing VANTEX proposal is malformed; no file changed.")
+        end = close + 2
+        proposed = original[:start] + new_block + original[end:]
+    else:
+        proposed = original.rstrip() + "\n\n" + new_block + "\n"
+    result = prepare_file_edit(PrepareEditRequest(path=str(target), new_content=proposed))
+    if not result.get("changed"):
+        raise HTTPException(status_code=409, detail="No CSS change was proposed.")
+    result["fix_type"] = fix_kind
+    result["project_root"] = str(project_root)
+    result["relative_path"] = str(target.relative_to(project_root))
+    result["source_mapping"] = "selector-token CSS match" if style_files else "stylesheet fallback"
+    result["proposed_declarations"] = declarations
+    result["caution"] = (
+        "Review the before/after preview and diff. Contrast uses a light mint foreground proposal "
+        "that may not suit every background; source remains unchanged until explicit approval."
+    )
+    return result
+
+
+class VisualPreviewRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+    selector: str = Field(min_length=1, max_length=500)
+    font_size: int = Field(default=12, ge=10, le=32)
+    fix_kind: str = Field(default="typography", max_length=30)
+    candidate_index: int | None = Field(default=None, ge=0, le=9)
+
+
+@app.post("/api/agent/qa/visual-preview")
+async def visual_preview(request: VisualPreviewRequest):
+    """Capture a temporary before/after preview; never edit source files."""
+    from urllib.parse import urlparse
+    import ipaddress
+
+    parsed = urlparse(request.url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Invalid website URL.")
+    host = parsed.hostname.lower()
+    allowed_local = host in ("localhost", "127.0.0.1", "::1")
+    if not allowed_local:
+        try:
+            allowed_local = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            allowed_local = False
+    if not allowed_local:
+        raise HTTPException(status_code=403, detail="Visual preview currently supports localhost URLs only.")
+
+    selector = request.selector.strip()
+    if (not selector or len(selector) > 500 or
+        not re.fullmatch(r"[A-Za-z0-9_.*#:\-\[\]=\"' >+~(),]+", selector)):
+        raise HTTPException(status_code=400, detail="Unsupported CSS selector.")
+
+    # VANTEX_SELECTOR_ESCAPE_V1: Tailwind variant colons inside class names
+    # must be escaped for querySelectorAll (e.g. .md:text-5xl -> .md\:text-5xl).
+    # Only escape colons that appear in a dot-prefixed class token, not pseudo-selectors.
+    selector = re.sub(
+        r"\.([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)+)",
+        lambda match: "." + match.group(1).replace(":", r"\:"),
+        selector,
+    )
+
+    browser = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 900}, device_scale_factor=1)
+            await page.goto(request.url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(500)
+            locator = page.locator(selector)
+            count = await locator.count()
+            if count == 0:
+                raise HTTPException(status_code=404, detail="No element matched this selector.")
+
+            candidates = []
+            for index in range(min(count, 10)):
+                item = locator.nth(index)
+                candidates.append({"index": index, "text": (await item.inner_text())[:120], "visible": await item.is_visible()})
+            visible = [item for item in candidates if item["visible"]]
+
+            if request.candidate_index is None and len(visible) != 1:
+                return {"needs_selection": True, "message": f"Selector matched {count} elements. Choose the correct visible element.", "candidates": candidates, "source_changed": False}
+
+            if request.candidate_index is None:
+                chosen_index = visible[0]["index"]
+            else:
+                chosen_index = request.candidate_index
+                if chosen_index >= count or not await locator.nth(chosen_index).is_visible():
+                    raise HTTPException(status_code=400, detail="Selected candidate is no longer visible. Run the preview again.")
+
+            chosen = locator.nth(chosen_index)
+            # Build a stable, unique CSS path for this exact DOM node.
+            unique_selector = await chosen.evaluate(r"""el => {
+              const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+              if (el.id) {
+                const byId = '#' + esc(el.id);
+                if (document.querySelectorAll(byId).length === 1) return byId;
+              }
+              const parts = [];
+              let node = el;
+              while (node && node.nodeType === 1 && parts.length < 8) {
+                let part = node.tagName.toLowerCase();
+                if (node.id) {
+                  const byId = '#' + esc(node.id);
+                  if (document.querySelectorAll(byId).length === 1) { parts.unshift(byId); break; }
+                }
+                const parent = node.parentElement;
+                if (parent) {
+                  const sameTag = Array.from(parent.children).filter(x => x.tagName === node.tagName);
+                  if (sameTag.length > 1) part += ':nth-of-type(' + (sameTag.indexOf(node) + 1) + ')';
+                }
+                if (node.classList.length) {
+                  const cls = Array.from(node.classList).filter(c => /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(c)).slice(0, 2);
+                  if (cls.length) part += cls.map(c => '.' + esc(c)).join('');
+                }
+                parts.unshift(part);
+                const candidate = parts.join(' > ');
+                try { if (document.querySelectorAll(candidate).length === 1) return candidate; } catch (_) {}
+                node = parent;
+              }
+              return parts.join(' > ');
+            }""")
+            unique_count = await page.locator(unique_selector).count()
+            if unique_count != 1:
+                raise HTTPException(status_code=409, detail="Could not create a unique selector for this element. No fix was prepared.")
+
+            before_png = await page.screenshot(type="png", full_page=False)
+            contrast_color = "#ffffff"
+            if request.fix_kind == "contrast":
+                contrast_color = await chosen.evaluate("""el => {
+                  const lum = rgb => {
+                    const c = rgb.map(v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+                    return 0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2];
+                  };
+                  let node = el, bg = [255,255,255];
+                  while (node && node.nodeType === 1) {
+                    const s = getComputedStyle(node), m = s.backgroundColor.match(/rgba?\((\d+)[, ]+\s*(\d+)[, ]+\s*(\d+)/i);
+                    if (m && !(s.backgroundColor.includes("0)") || s.backgroundColor.includes("/ 0)"))) { bg = [+m[1],+m[2],+m[3]]; break; }
+                    node = node.parentElement;
+                  }
+                  const l = lum(bg), white = 1.05/(l+0.05), dark = (l+0.05)/(0.006+0.05);
+                  return white >= dark ? "#ffffff" : "#111827";
+                }""")
+            if request.fix_kind == "accessibility":
+                preview_label = await chosen.evaluate("""el => {
+                  const placeholder = (el.getAttribute('placeholder') || '').trim();
+                  const name = (el.getAttribute('name') || el.id || '').replace(/[_-]+/g, ' ').trim();
+                  const type = (el.getAttribute('type') || '').toLowerCase();
+                  const typeNames = {email:'Email address', password:'Password', search:'Search', tel:'Phone number', url:'Website address', number:'Number'};
+                  return placeholder || (name ? name.charAt(0).toUpperCase() + name.slice(1) : '') || typeNames[type] || 'Input field';
+                }""")
+                preview_declarations = {"aria-label": preview_label}
+                await chosen.evaluate("(el, label) => el.setAttribute('aria-label', label)", preview_label)
+            else:
+                preview_declarations = _ui_fix_declarations(request.fix_kind)
+                if request.fix_kind == "typography":
+                    preview_declarations = {"font-size": f"{request.font_size}px"}
+                await chosen.evaluate(
+                    """(el, declarations) => {
+                        for (const [property, value] of Object.entries(declarations)) {
+                            el.style.setProperty(property, value, 'important');
+                        }
+                    }""",
+                    preview_declarations,
+                )
+            await page.wait_for_timeout(300)
+            after_png = await page.screenshot(type="png", full_page=False)
+            return {
+                "url": page.url,
+                "selector": selector,
+                "unique_selector": unique_selector,
+                "selected_index": chosen_index,
+                "font_size": request.font_size,
+                "fix_kind": request.fix_kind,
+                "preview_declarations": preview_declarations,
+                "contrast_color": contrast_color,
+                "before_image": "data:image/png;base64," + base64.b64encode(before_png).decode("ascii"),
+                "after_image": "data:image/png;base64," + base64.b64encode(after_png).decode("ascii"),
+                "source_changed": False,
+                "message": "Temporary browser preview created for the selected element; source file unchanged.",
+            }
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Visual preview failed: {str(error)[:200]}") from error
+    finally:
+        if browser is not None:
+            await browser.close()
+
+
 @app.post("/api/agent/files/apply-edit")
 def apply_file_edit(request: ApplyEditRequest):
     if not request.approve:
@@ -633,7 +1704,10 @@ def apply_file_edit(request: ApplyEditRequest):
             detail="Proposal not found or expired after a server restart.",
         )
 
-    target = resolve_agent_path(proposal["path"])
+    try:
+        target = resolve_agent_path(proposal["path"])
+    except HTTPException:
+        target = resolve_selected_project_path(proposal["path"])
 
     if not target.is_file() or target.is_symlink():
         raise HTTPException(status_code=403, detail="Target is no longer a regular file.")
@@ -649,7 +1723,13 @@ def apply_file_edit(request: ApplyEditRequest):
         )
 
     new_content = proposal["new_content"]
-    backup_dir = AGENT_ROOT / ".vantex_backups"
+    try:
+        target.relative_to(AGENT_ROOT)
+        backup_root = AGENT_ROOT
+    except ValueError:
+        target.relative_to(SELECTED_PROJECT_ROOT.resolve(strict=True))
+        backup_root = SELECTED_PROJECT_ROOT.resolve(strict=True)
+    backup_dir = backup_root / ".vantex_backups"
     backup_dir.mkdir(exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -694,14 +1774,175 @@ import re
 from pydantic import Field
 
 
+
+class LocalChatRequest(BaseModel):
+    message: str
+    history: list[dict[str, str]] = []
+
+
+@app.post("/api/agent/chat")
+async def local_agent_chat(request: LocalChatRequest):
+    import asyncio
+    import json
+    import urllib.request
+    import urllib.error
+
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if len(message) > 2000:
+        raise HTTPException(status_code=400, detail="Message is too long.")
+
+    messages = [{
+        "role": "system",
+        "content": (
+            "You are VANTEX, a friendly local desktop AI assistant. "
+            "Speak naturally and conversationally. Understand English, Hindi "
+            "and Hinglish. Respond to greetings warmly, answer follow-up "
+            "questions using the conversation history, and keep replies concise. "
+            "You can explain PC troubleshooting, but you cannot directly inspect "
+            "or control the computer through this chat endpoint. Never claim "
+            "you performed an action unless a separate tool confirms it. "
+            "Do not tell the user to run destructive commands without explaining "
+            "the risk and obtaining confirmation."
+        ),
+    }]
+
+    for item in request.history[-10:]:
+        role = item.get("role")
+        content = item.get("content", "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content[:2000]})
+
+    messages.append({"role": "user", "content": message})
+
+    payload = json.dumps({
+        "model": "qwen2.5:3b",
+        "messages": messages,
+        "stream": False,
+        "keep_alive": "30s",
+        "options": {
+            "num_ctx": 2048,
+            "num_predict": 180,
+        },
+    }).encode("utf-8")
+
+    def call_ollama():
+        req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=90) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        data = await asyncio.to_thread(call_ollama)
+        reply = data.get("message", {}).get("content", "").strip()
+        if not reply:
+            raise HTTPException(status_code=502, detail="Local AI returned an empty reply.")
+        return {"reply": reply, "model": "qwen2.5:3b", "local": True}
+    except urllib.error.URLError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama is unavailable. Start Ollama and try again."
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Local AI took too long to respond.") from exc
+
+
 class AgentCommandRequest(BaseModel):
     command: str = Field(min_length=1, max_length=2000)
 
+
+# Controlled desktop application launcher. Uses a fixed allowlist and never a shell.
+PC_APP_CANDIDATES = {
+    "vscode": ("code",),
+    "vs code": ("code",),
+    "visual studio code": ("code",),
+    "terminal": ("x-terminal-emulator", "xfce4-terminal", "konsole", "gnome-terminal"),
+    "browser": ("firefox", "chromium", "google-chrome", "brave-browser"),
+    "firefox": ("firefox",),
+    "chrome": ("google-chrome", "chromium", "chromium-browser"),
+    "file manager": ("thunar", "nautilus", "dolphin", "pcmanfm"),
+    "files": ("thunar", "nautilus", "dolphin", "pcmanfm"),
+    "text editor": ("mousepad", "gedit", "kate", "xed"),
+    "mousepad": ("mousepad",),
+    "libreoffice": ("libreoffice",),
+    "vlc": ("vlc",),
+}
+def _available_pc_apps():
+    return [
+        {
+            "label": app["name"],
+            "executable": app.get("desktop_file")
+            or app.get("shortcut")
+            or app.get("app_path"),
+        }
+        for app in discover_apps()
+    ]
+
+
+@app.get("/api/agent/pc-control/apps")
+def list_pc_control_apps():
+    apps = _available_pc_apps()
+    return {
+        "apps": apps,
+        "count": len(apps),
+        "message": "Applications discovered from this operating system.",
+    }
+
+
+class PCAppLaunchRequest(BaseModel):
+    app: str = Field(min_length=1, max_length=160)
+
+
+@app.post("/api/agent/pc-control/launch")
+def launch_pc_control_app(request: PCAppLaunchRequest):
+    try:
+        return launch_app(request.app)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+def _launch_pc_app(label: str):
+    import shutil
+    import subprocess
+    from fastapi import HTTPException
+    candidates = PC_APP_CANDIDATES.get(label)
+    if not candidates:
+        raise HTTPException(status_code=400, detail="That application is not on VANTEX's allowlist.")
+    executable = next((shutil.which(name) for name in candidates if shutil.which(name)), None)
+    if not executable:
+        raise HTTPException(status_code=404, detail=f"{label} is not installed or its launcher was not found.")
+    try:
+        subprocess.Popen([executable], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, env=__import__("os").environ.copy())
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not launch {label}: {exc}") from exc
+    return {"launched": True, "app": label, "executable": executable,
+            "message": f"Launch request sent to {label}."}
 
 @app.post("/api/agent/command")
 async def run_agent_command(request: AgentCommandRequest):
     command = request.command.strip()
     lowered = command.casefold()
+
+    # Explicit app-launch commands. This is checked before file-open parsing.
+    app_match = re.fullmatch(
+        r"\s*(?:please\s+)?(?:open|launch|start|run|kholo|khol|khul)\s+(?:the\s+)?"
+        r"(visual studio code|vs code|vscode|terminal|browser|firefox|chrome|file manager|files|text editor|mousepad|libreoffice|vlc)\s*[.!]?\s*",
+        lowered,
+    )
+    if app_match:
+        label = app_match.group(1).strip()
+        if label == "vscode":
+            label = "vscode"
+        return {"command": command, "action": "launch_pc_app", "result": _launch_pc_app(label)}
 
     # Natural-language PC file commands
     open_words = ("open", "open file", "kholo", "khol", "khul")
@@ -1227,6 +2468,25 @@ async def run_agent_command(request: AgentCommandRequest):
                 "result": opened,
             }
 
+    # Launch installed apps before treating "open <target>" as a file request.
+    app_match = re.fullmatch(
+        r"(?:open|launch|start|run|kholo|khol)\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+    if app_match:
+        app_target = app_match.group(1).strip()
+        try:
+            app_result = launch_app(app_target)
+            if app_result.get("launched") or app_result.get("ambiguous"):
+                return {
+                    "command": command,
+                    "action": "launch_pc_app",
+                    "result": app_result,
+                }
+        except LookupError:
+            pass
+
     # Open a named file only if there is one unambiguous match.
     open_match = re.fullmatch(
         r"(?:open(?:\s+file)?|kholo|khol|khul)\s+(.+)",
@@ -1425,11 +2685,271 @@ import subprocess
 from datetime import datetime
 from pydantic import BaseModel, Field
 
-PC_FILE_ROOTS = [
-    (Path.home() / name).resolve()
-    for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos")
-    if (Path.home() / name).is_dir()
-]
+# File Operator roots: standard folders plus user-approved folders.
+import json
+
+PC_APPROVED_FOLDERS_FILE = Path.home() / ".config" / "vantex" / "approved_folders.json"
+
+PC_FULL_ACCESS_FILE = Path.home() / ".config" / "vantex" / "full_pc_access.json"
+
+def load_pc_file_roots():
+    try:
+        access_state = json.loads(PC_FULL_ACCESS_FILE.read_text(encoding="utf-8"))
+        if isinstance(access_state, dict) and access_state.get("enabled") is True:
+            return [Path.home().resolve()]
+    except (OSError, ValueError, TypeError):
+        pass
+
+    roots = [
+        (Path.home() / name).resolve()
+        for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos")
+        if (Path.home() / name).is_dir()
+    ]
+    try:
+        saved = json.loads(PC_APPROVED_FOLDERS_FILE.read_text(encoding="utf-8"))
+        if isinstance(saved, list):
+            for raw in saved:
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    candidate = Path(raw).expanduser().resolve(strict=True)
+                    if (candidate.is_dir()
+                            and candidate != Path(candidate.anchor)
+                            and candidate != Path.home().resolve()
+                            and candidate not in roots):
+                        roots.append(candidate)
+                except (OSError, RuntimeError):
+                    continue
+    except (OSError, ValueError, TypeError):
+        pass
+    return roots
+
+PC_FILE_ROOTS = load_pc_file_roots()
+
+class AllowAllPcFilesRequest(BaseModel):
+    confirm: bool = False
+
+@app.post("/api/agent/pc-files/allow-all")
+def allow_all_pc_files(request: AllowAllPcFilesRequest):
+    global PC_FILE_ROOTS
+    if request.confirm is not True:
+        raise HTTPException(status_code=400, detail="Explicit confirmation is required.")
+
+    try:
+        PC_FULL_ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PC_FULL_ACCESS_FILE.write_text(
+            json.dumps({"enabled": True, "enabled_at": datetime.now().astimezone().isoformat()}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save access setting: {exc}") from exc
+
+    PC_FILE_ROOTS = [Path.home().resolve()]
+    return {
+        "enabled": True,
+        "mode": "user-home",
+        "roots": [str(PC_FILE_ROOTS[0])],
+        "message": "Full user-folder search/read access enabled. Restart is not required.",
+    }
+
+
+class ApproveFolderRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=2000)
+
+@app.post("/api/agent/pc-files/approve-folder")
+def approve_pc_folder(request: ApproveFolderRequest):
+    global PC_FILE_ROOTS
+    candidate = Path(request.path).expanduser()
+    try:
+        if candidate.is_symlink():
+            raise ValueError("Symlink folders cannot be approved.")
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError("Selected path is not a folder.")
+        if resolved == Path(resolved.anchor) or resolved == Path.home().resolve():
+            raise ValueError("Choose a specific folder, not the filesystem root or entire home folder.")
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "Folder does not exist.") from exc
+
+    if resolved not in PC_FILE_ROOTS:
+        PC_FILE_ROOTS.append(resolved)
+
+    try:
+        PC_APPROVED_FOLDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        defaults = {
+            (Path.home() / name).resolve()
+            for name in ("Desktop", "Documents", "Downloads", "Pictures", "Videos")
+            if (Path.home() / name).is_dir()
+        }
+        custom_roots = [str(root) for root in PC_FILE_ROOTS if root not in defaults]
+        PC_APPROVED_FOLDERS_FILE.write_text(
+            json.dumps(sorted(set(custom_roots)), indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        PC_FILE_ROOTS = load_pc_file_roots()
+        raise HTTPException(status_code=500, detail=f"Could not save folder approval: {exc}") from exc
+
+    return {"approved": True, "path": str(resolved),
+            "message": f"Folder approved for file search and read: {resolved}",
+            "approved_roots": [str(root) for root in PC_FILE_ROOTS]}
+
+# Keep wl-copy alive while it owns the Wayland clipboard.
+
+
+# Keep this variable at module level, outside the endpoint.
+_CLIPBOARD_PROCESS = None
+
+
+@app.post("/api/agent/pc-files/copy")
+def copy_pc_file(request: ApproveFolderRequest):
+    import os
+    import shutil
+    import subprocess
+    import time
+    from fastapi import HTTPException
+
+    global _CLIPBOARD_PROCESS
+
+    # Resolve and validate the original file.
+    try:
+        safe_path = resolve_pc_file(request.path)
+        if not safe_path.is_file():
+            raise HTTPException(status_code=404, detail="File not found.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file path: {exc}",
+        ) from exc
+
+    # Ensure this backend can access the current Wayland session.
+    wl_copy = shutil.which("wl-copy")
+    wl_paste = shutil.which("wl-paste")
+
+    if not wl_copy or not wl_paste:
+        raise HTTPException(
+            status_code=503,
+            detail="Clipboard tools missing. Install them with: sudo apt install wl-clipboard",
+        )
+
+    if not os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("XDG_RUNTIME_DIR"):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The backend cannot access the Wayland desktop session. "
+                "Start VANTEX from your logged-in desktop terminal."
+            ),
+        )
+
+    # Standard URI-list format for file managers.
+    expected_uri = safe_path.as_uri()
+    payload = (expected_uri + "\r\n").encode("utf-8")
+
+    try:
+        # Release the clipboard held by the previous VANTEX copy operation.
+        if (
+            _CLIPBOARD_PROCESS is not None
+            and _CLIPBOARD_PROCESS.poll() is None
+        ):
+            _CLIPBOARD_PROCESS.terminate()
+            try:
+                _CLIPBOARD_PROCESS.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                _CLIPBOARD_PROCESS.kill()
+                _CLIPBOARD_PROCESS.wait(timeout=2)
+
+        # Keep wl-copy running so it continues to own the clipboard.
+        process = subprocess.Popen(
+            [
+                wl_copy,
+                "--foreground",
+                "--type",
+                "text/uri-list",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=os.environ.copy(),
+        )
+        _CLIPBOARD_PROCESS = process
+
+        if process.stdin is None:
+            raise RuntimeError("Could not open clipboard input.")
+
+        try:
+            process.stdin.write(payload)
+            process.stdin.close()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(
+                "wl-copy stopped before receiving the file URI."
+            ) from exc
+
+        # Allow Wayland to register the new clipboard owner.
+        time.sleep(0.25)
+
+        if process.poll() is not None:
+            _CLIPBOARD_PROCESS = None
+            raise RuntimeError(
+                "wl-copy exited early. Check that the Wayland session is accessible."
+            )
+
+        # Verify the clipboard really contains the expected file URI.
+        check = subprocess.run(
+            [
+                wl_paste,
+                "--type",
+                "text/uri-list",
+                "--no-newline",
+            ],
+            capture_output=True,
+            timeout=3,
+            env=os.environ.copy(),
+        )
+
+        actual_uri = check.stdout.decode("utf-8", errors="replace").strip()
+
+        if check.returncode != 0 or actual_uri != expected_uri:
+            raise RuntimeError(
+                "Clipboard verification failed: the expected file URI "
+                "was not found. Another application may have replaced it, "
+                "or the desktop clipboard is inaccessible."
+            )
+
+        return {
+            "copied": True,
+            "path": str(safe_path),
+            "message": (
+                "File URI verified on the system clipboard. "
+                "Try Ctrl+V in your file manager."
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"File clipboard copy failed: {exc}",
+        ) from exc
+
+
+@app.get("/api/agent/pc-files/read")
+def read_pc_file(path: str = Query(min_length=1, max_length=2000)):
+    safe_path = resolve_pc_file(path)
+    if safe_path.stat().st_size > MAX_READ_BYTES:
+        raise HTTPException(status_code=413, detail="File exceeds the 1 MB read limit.")
+    try:
+        content = safe_path.read_bytes()
+        if b"\x00" in content:
+            raise HTTPException(status_code=415, detail="Binary files cannot be copied as text.")
+        text_content = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=415, detail="File is not valid UTF-8 text; use a file attachment instead.") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="Permission denied.") from exc
+    return {"path": str(safe_path), "size_bytes": len(content),
+            "content": text_content, "read_only": True}
 
 PC_SKIP_DIRS = {"venv", "env", ".tox", 
     ".git", ".venv", "node_modules", "__pycache__",
@@ -1464,21 +2984,70 @@ def resolve_pc_file(raw_path: str) -> Path:
 
 
 def scan_pc_files():
-    # Give every approved root its own scan budget so a large
-    # Desktop tree cannot prevent Pictures from being scanned.
-    for root in PC_FILE_ROOTS:
+    """Scan approved folders with an independent limit per top-level folder."""
+    home = Path.home().resolve()
+    skip_dirs = PC_SKIP_DIRS | {".config"}
+
+    targets = []
+    seen_targets = set()
+
+    def add_target(path, direct_only=False):
+        try:
+            resolved = path.resolve(strict=True)
+            if not resolved.is_dir() or resolved.is_symlink():
+                return
+            key = (str(resolved), direct_only)
+            if key not in seen_targets:
+                seen_targets.add(key)
+                targets.append((resolved, direct_only))
+        except (OSError, RuntimeError):
+            return
+
+    for approved_root in PC_FILE_ROOTS:
+        try:
+            root = approved_root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+
+        if root == home:
+            # Scan files directly in the home folder separately.
+            add_target(root, direct_only=True)
+
+            # Give each top-level folder its own scan budget.
+            try:
+                children = sorted(root.iterdir(), key=lambda p: p.name.casefold())
+            except OSError:
+                children = []
+
+            for child in children:
+                if (
+                    child.name.startswith(".")
+                    or child.name in skip_dirs
+                    or child.is_symlink()
+                ):
+                    continue
+                add_target(child)
+        else:
+            add_target(root)
+
+    for root, direct_only in targets:
         scanned = 0
 
         for current, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = [
-                name for name in dirs
-                if name not in PC_SKIP_DIRS
-                and not name.startswith(".")
-                and not (Path(current) / name).is_symlink()
-            ]
+            current_path = Path(current)
+
+            if direct_only and current_path == root:
+                dirs[:] = []
+            else:
+                dirs[:] = [
+                    name for name in dirs
+                    if name not in skip_dirs
+                    and not name.startswith(".")
+                    and not (current_path / name).is_symlink()
+                ]
 
             for name in files:
-                candidate = Path(current) / name
+                candidate = current_path / name
 
                 if name.startswith(".") or candidate.is_symlink():
                     continue
