@@ -1752,7 +1752,8 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
               : '';
 
       // Content search results.
-      if (intent.type === 'content') {
+      // Handle content searches identified by either frontend intent or backend action.
+      if (intent.type === 'content' || action === 'search_file_content') {
         const rawResults = Array.isArray(obj?.results)
           ? obj.results
           : Array.isArray(resultData?.results)

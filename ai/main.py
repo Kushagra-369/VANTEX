@@ -2701,6 +2701,11 @@ async def run_agent_command(request: AgentCommandRequest):
         intent = json.loads(raw_intent)
 
         action = intent.get("action")
+        print(
+            f"[VANTEX DEBUG] command={command!r} "
+            f"classifier_intent={intent!r}",
+            flush=True,
+        )
         query = intent.get("query", "")
         folder = intent.get("folder", "")
         app = intent.get("app", "")
@@ -2813,10 +2818,16 @@ async def run_agent_command(request: AgentCommandRequest):
                 "result": reply,
             }
 
+        # If intent classification is uncertain, treat the input as
+        # natural conversation instead of failing with a generic message.
+        reply = await local_agent_chat(
+            LocalChatRequest(message=command, history=[])
+        )
         return {
             "command": command,
-            "action": "clarify",
-            "message": "I couldn't determine the request. Please rephrase it.",
+            "action": "chat",
+            "message": reply.get("reply", ""),
+            "result": reply,
         }
 
     except HTTPException:
