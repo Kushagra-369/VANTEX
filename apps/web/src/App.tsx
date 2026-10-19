@@ -27,8 +27,10 @@ type PCIntelligenceProps = {
   onBack: () => void;
 };
 
-const API = 'http://127.0.0.1:8000';
-
+const API = import.meta.env.PROD
+  ? 'https://vantex-2d4l.onrender.com'
+  : 'http://127.0.0.1:8000';
+  
 async function fetchJSON<T,>(url: string): Promise<T> {
   const response = await fetch(url);
   const body: unknown = await response.json().catch(() => ({}));
