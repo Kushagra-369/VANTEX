@@ -1717,9 +1717,9 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
 
         const contentQuery = wantsContent
           ? input
-              .replace(/\b(find|search|locate|list|show|please|bhai|mujhe|mera|meri|mere|all|my|the|files|file|documents|document|resumes|resume|cvs|cv|pdf|with|containing|contains|inside|mentioning|mentions|whose|content|text|in|inside|from|on|my|pc|computer|laptop|desktop|downloads|pictures|videos)\b/gi, ' ')
-              .replace(/\s+/g, ' ')
-              .trim()
+            .replace(/\b(find|search|locate|list|show|please|bhai|mujhe|mera|meri|mere|all|my|the|files|file|documents|document|resumes|resume|cvs|cv|pdf|with|containing|contains|inside|mentioning|mentions|whose|content|text|in|inside|from|on|my|pc|computer|laptop|desktop|downloads|pictures|videos)\b/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
           : intent.query;
 
         await searchFiles(
@@ -2052,6 +2052,31 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
               VOICE INTERACTION · LOCAL PC AGENT
             </span>
           </div>
+
+          <div className="voice-text-input">
+            <span className="voice-text-label">OR TYPE YOUR COMMAND</span>
+
+            <div className="voice-text-row">
+              <input
+                type="text"
+                value={command}
+                onChange={(event) => setCommand(event.target.value)}
+                placeholder="Ask VANTEX anything..."
+                aria-label="Type a command for VANTEX"
+                disabled={loading}
+              />
+
+              <button
+                type="submit"
+                className="voice-text-send"
+                disabled={loading || !command.trim()}
+                aria-label="Send command"
+              >
+                {loading ? "…" : "➤"}
+              </button>
+            </div>
+          </div>
+
         </form>
 
         <button
