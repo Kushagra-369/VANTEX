@@ -1,0 +1,6 @@
+{
+  "client_id": "PASTE_VANTEX_OAUTH_PUBLIC_CLIENT_ID_HERE",
+  "redirect_uri": "http://localhost:8000/api/cloudinary/oauth/callback",
+  "frontend_url": "http://localhost:5173",
+  "data_dir": ".vantex_cloudinary_data"
+}

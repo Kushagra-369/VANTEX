@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import CloudinaryUploader from '../CloudinaryUploader/CloudinaryUploader';
 import './Home.css';
 
 let kokoroPromise: Promise<any> | null = null;
@@ -1310,6 +1311,7 @@ function FileResults({
 
 export default function Home({ onOpenIntelligence }: HomeProps) {
   const [command, setCommand] = useState('');
+  const [showCloudinaryPanel, setShowCloudinaryPanel] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<ResultData | null>(null);
@@ -1643,6 +1645,17 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
     const input = command.trim();
 
     if (!input || loading) return;
+
+    // VANTEX_CLOUDINARY_COMMAND_ROUTING
+    // Open the uploader only when the user explicitly asks for cloud/image upload.
+    if (/\b(cloud|cloudinary|cloud storage|cloud upload|image upload|img upload|upload image|upload img|upload photo|upload picture|upload an image|upload this image)\b/i.test(input)) {
+      setShowCloudinaryPanel(true);
+      setError('');
+      setResult(null);
+      return;
+    }
+    setShowCloudinaryPanel(false);
+
 
     setLoading(true);
     setError('');
@@ -2023,7 +2036,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
             {projectMessage && <p role="status" style={{ margin: "10px 0 0", color: "#b8e9ca", fontSize: "13px" }}>{projectMessage}</p>}
           </section>
         )}
-        <form className="command-form voice-first-form" onSubmit={handleSubmit}>
+<form className="command-form voice-first-form" onSubmit={handleSubmit}>
           <div className="voice-stage">
             <div className={`voice-stage-orb${voiceListening ? " voice-stage-orb-active" : ""}${loading ? " voice-stage-orb-thinking" : ""}`}>
               <span className="voice-stage-core">V</span>
@@ -2078,6 +2091,31 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
           </div>
 
         </form>
+        {showCloudinaryPanel && (
+          <section className="vantex-action-panel vantex-cloudinary-command-panel">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '12px', flexWrap: 'wrap' }}>
+              <div>
+                <h3 style={{ margin: 0 }}>Cloudinary Image Upload</h3>
+                <p style={{ margin: '6px 0 0' }}>Your Cloudinary settings stay in this browser profile.</p>
+              </div>
+              <button type="button" className="qa-fix-button" onClick={() => setShowCloudinaryPanel(false)}>Close</button>
+            </div>
+            <CloudinaryUploader />
+          </section>
+        )}
+
+
+        {showCloudinaryPanel && (
+          <section className="vantex-action-panel cloudinary-command-panel">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '12px' }}>
+              <div>
+                <h3 style={{ margin: 0 }}>Cloudinary Image Upload</h3>
+                <p style={{ margin: '6px 0 0' }}>Upload to your own Cloudinary account and get a shareable image URL.</p>
+              </div>
+              <button type="button" className="qa-fix-button" onClick={() => setShowCloudinaryPanel(false)}>Close</button>
+            </div>
+</section>
+        )}
 
         <button
           type="button"

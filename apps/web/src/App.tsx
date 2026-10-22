@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import Home from './components/Home/Home';
+import CloudinaryGallery from './components/CloudinaryGallery';
 import './App.css';
 
 type HealthStatus = 'up' | 'down' | 'running' | 'checking' | 'unknown';
@@ -605,14 +606,39 @@ function PCIntelligence({ onBack }: PCIntelligenceProps) {
 }
 
 export default function App() {
-  const [page, setPage] = useState<'home' | 'intelligence'>('home');
+  const [page, setPage] = useState<'home' | 'intelligence' | 'cloudinary'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.has('cloudinary_oauth') ? 'cloudinary' : 'home';
+  });
 
   return (
     <main className="vantex-app">
       {page === 'home' ? (
-        <Home onOpenIntelligence={() => setPage('intelligence')} />
-      ) : (
+        <>
+          <Home onOpenIntelligence={() => setPage('intelligence')} />
+       
+        </>
+      ) : page === 'intelligence' ? (
         <PCIntelligence onBack={() => setPage('home')} />
+      ) : (
+        <section style={{ padding: '24px', minHeight: '80vh', background: '#050a07' }}>
+          <button
+            type="button"
+            onClick={() => setPage('home')}
+            style={{
+              marginBottom: 16,
+              padding: '10px 14px',
+              borderRadius: 9,
+              border: '1px solid rgba(91,255,160,.28)',
+              background: '#123a24',
+              color: '#aaffc4',
+              cursor: 'pointer',
+            }}
+          >
+            ← Back to VANTEX
+          </button>
+          <CloudinaryGallery />
+        </section>
       )}
     </main>
   );
