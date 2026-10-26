@@ -82,96 +82,6 @@ function getMessage(value: unknown, fallback = 'Request completed.'): string {
   return fallback;
 }
 
-function findFileItems(value: unknown, depth = 0): FileItem[] {
-  if (depth > 5 || value == null) {
-    return [];
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .map((item): FileItem | null => {
-        if (typeof item === 'string') {
-          return {
-            name: item.split('/').pop() || item,
-            path: item,
-          };
-        }
-
-        const obj = asObject(item);
-
-        if (!obj) {
-          return null;
-        }
-
-        const path = [
-          obj.path,
-          obj.full_path,
-          obj.absolute_path,
-          obj.file_path,
-          obj.location,
-        ].find((entry): entry is string => typeof entry === 'string');
-
-        const name = [
-          obj.name,
-          obj.filename,
-          obj.file_name,
-        ].find((entry): entry is string => typeof entry === 'string');
-
-        if (!path && !name) {
-          return null;
-        }
-
-        const finalPath = path || name || '';
-
-        return {
-          name: name || finalPath.split('/').pop() || finalPath,
-          path: finalPath,
-          type:
-            typeof obj.type === 'string'
-              ? obj.type
-              : typeof obj.kind === 'string'
-                ? obj.kind
-                : undefined,
-          preview:
-            typeof obj.preview === 'string'
-              ? obj.preview
-              : typeof obj.snippet === 'string'
-                ? obj.snippet
-                : typeof obj.content_preview === 'string'
-                  ? obj.content_preview
-                  : undefined,
-        };
-      })
-      .filter((item): item is FileItem => item !== null);
-  }
-
-  const obj = asObject(value);
-
-  if (!obj) {
-    return [];
-  }
-
-  for (const key of [
-    'matches',
-    'files',
-    'items',
-    'results',
-    'entries',
-    'data',
-    'result',
-  ]) {
-    if (obj[key] !== undefined) {
-      const found = findFileItems(obj[key], depth + 1);
-
-      if (found.length) {
-        return found;
-      }
-    }
-  }
-
-  return [];
-}
-
 function getHostname(url: string): string {
   try {
     return new URL(url).hostname;
@@ -238,6 +148,14 @@ function detectIntent(input: string) {
     return { type: 'system' as const };
   }
 
+  // Hinglish content searches, e.g. "resume files mein Python dhundho".
+  if (
+    /\b(files?|resumes?|cvs?)\b/i.test(text) &&
+    /\b(mein|ke andar|andar|inside|within)\b/i.test(text) &&
+    /\b(search|find|dhundho|dhoondho|dhundh|dhoondh|khojo|search karo|batao)\b/i.test(text)
+  ) {
+    return { type: 'content' as const, query: text };
+  }
   // Explicit searches inside file contents.
   const contentPatterns = [
     /^(?:please\s+)?(?:search|find|look for)\s+(?:all\s+)?files?\s+(?:with|containing|that contain|mentioning)\s+(.+)$/i,
@@ -254,9 +172,18 @@ function detectIntent(input: string) {
     }
   }
 
+  // Route explicit URL-opening commands to the backend, not file search.
+  const explicitHttpUrl = text.match(/https?:\/\/[^\s"'<>]+/i)?.[0];
+  if (
+    explicitHttpUrl &&
+    /\b(open|launch|go\s+to|navigate\s+to|visit|kholo|khol|khul)\b/i.test(text)
+  ) {
+    return { type: 'command' as const, command: text };
+  }
+
   // Open/launch a file or folder.
   const isOpen =
-    /^(?:please\s+)?(?:open|launch|show|khol|kholo|khul)\b/i.test(text) ||
+    /^(?:please\s+)?(?:open|launch|khol|kholo|khul)\b/i.test(text) ||
     /\b(?:open|kholo|khol|khul)\s+(?:the\s+)?(?:file|folder)\b/i.test(text);
 
   if (isOpen) {
@@ -1317,6 +1244,37 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
   const [result, setResult] = useState<ResultData | null>(null);
   const [openingPath, setOpeningPath] = useState('');
   const [history, setHistory] = useState<string[]>([]);
+  const [conversationHistory, setConversationHistory] = useState<
+    { role: 'user' | 'assistant'; content: string }[]
+  >(() => {
+    try {
+      const saved = localStorage.getItem('vantex-conversation-history');
+      if (!saved) return [];
+      const parsed: unknown = JSON.parse(saved);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (item): item is { role: 'user' | 'assistant'; content: string } =>
+          item !== null &&
+          typeof item === 'object' &&
+          ((item as { role?: unknown }).role === 'user' ||
+            (item as { role?: unknown }).role === 'assistant') &&
+          typeof (item as { content?: unknown }).content === 'string',
+      ).slice(-20);
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'vantex-conversation-history',
+        JSON.stringify(conversationHistory),
+      );
+    } catch (error) {
+      console.error('[VANTEX] Could not save conversation history:', error);
+    }
+  }, [conversationHistory]);
   const [projectPath, setProjectPath] = useState('');
   const [projectInfo, setProjectInfo] = useState<Record<string, unknown> | null>(null);
   const [projectBusy, setProjectBusy] = useState(false);
@@ -1567,45 +1525,6 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
   }
 
 
-  async function searchFiles(
-    query: string,
-    contentSearch = false,
-    folder?: string,
-  ) {
-    console.log('[VANTEX] Search query:', query);
-    console.log('[VANTEX] Search folder:', folder ?? 'all folders');
-    console.log('[VANTEX] Content search:', contentSearch);
-
-    const endpoint = contentSearch
-      ? '/api/agent/pc-files/search-content'
-      : '/api/agent/pc-files/search';
-
-    const params = new URLSearchParams({ query });
-
-    if (folder) {
-      params.set('folder', folder.charAt(0).toUpperCase() + folder.slice(1));
-    }
-
-    const data = await requestJSON(
-      `${API}${endpoint}?${params.toString()}`,
-    );
-
-    const files = findFileItems(data);
-
-    setResult({
-      title: contentSearch
-        ? 'Content search results'
-        : 'File search results',
-      message: files.length
-        ? `Found ${files.length} matching ${files.length === 1 ? 'result' : 'results'
-        }.`
-        : getResultMessage(data, 'No matching files were found.'),
-      files,
-      data,
-    });
-  }
-
-
   async function openFile(file: FileItem) {
     setOpeningPath(file.path);
     setError('');
@@ -1668,6 +1587,30 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
     try {
       const intent = detectIntent(input);
 
+      const creatorQuestion =
+        /\b(who\s+(made|created|built|developed)\s+you|who\s+is\s+your\s+(creator|developer)|tumhe\s+(kisne|kis\s+ne)\s+(banaya|banaya\s+hai)|tumhara\s+creator\s+kaun\s+hai)\b/i.test(input.trim());
+
+      if (creatorQuestion) {
+        const reply =
+          'I was created by Kushagra as part of the VANTEX AI project.';
+
+        setResult({
+          title: 'VANTEX',
+          message: reply,
+        });
+
+        setConversationHistory((previous) =>
+          [
+            ...previous,
+            { role: 'user' as const, content: input },
+            { role: 'assistant' as const, content: reply },
+          ].slice(-20),
+        );
+
+        setLoading(false);
+        return;
+      }
+
       console.log('[VANTEX] Input:', input);
       console.log('[VANTEX] Detected intent:', intent);
 
@@ -1723,32 +1666,12 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
         return;
       }
 
-      // Route filename searches and searches inside file contents separately.
-      if (intent.type === 'files') {
-        const wantsContent = /\b(with|containing|contains|inside|mentioning|mentions|whose content|text contains)\b/i.test(input)
-          && /\b(resume|resumes|cv|cvs|file|files|pdf|document|documents)\b/i.test(input);
-
-        const contentQuery = wantsContent
-          ? input
-            .replace(/\b(find|search|locate|list|show|please|bhai|mujhe|mera|meri|mere|all|my|the|files|file|documents|document|resumes|resume|cvs|cv|pdf|with|containing|contains|inside|mentioning|mentions|whose|content|text|in|inside|from|on|my|pc|computer|laptop|desktop|downloads|pictures|videos)\b/gi, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-          : intent.query;
-
-        await searchFiles(
-          wantsContent && contentQuery ? contentQuery : intent.query,
-          wantsContent,
-          intent.folder,
-        );
-        return;
-      }
-
       // Send a command to the existing PC command handler.
       // The backend decides which supported action to execute.
       const data = await requestJSON(`${API}/api/agent/command`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: input }),
+        body: JSON.stringify({ command: input, history: conversationHistory.slice(-10) }),
       });
 
       const obj = asObject(data);
@@ -1758,17 +1681,27 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
         typeof obj?.action === 'string' ? obj.action : '';
 
       const backendMessage =
-        typeof obj?.message === 'string'
-          ? obj.message
-          : typeof obj?.detail === 'string'
-            ? obj.detail
-            : typeof resultData?.message === 'string'
-              ? resultData.message
-              : '';
+        (typeof obj?.message === 'string' && obj.message.trim()) ||
+        (typeof obj?.reply === 'string' && obj.reply.trim()) ||
+        (typeof obj?.detail === 'string' && obj.detail.trim()) ||
+        (typeof resultData?.message === 'string' &&
+          resultData.message.trim()) ||
+        (typeof resultData?.reply === 'string' &&
+          resultData.reply.trim()) ||
+        '';
+      if (action === 'chat' && backendMessage) {
+        setConversationHistory((previous) =>
+          [
+            ...previous,
+            { role: 'user' as const, content: input },
+            { role: 'assistant' as const, content: backendMessage },
+          ].slice(-20),
+        );
+      }
 
       // Content search results.
       // Handle content searches identified by either frontend intent or backend action.
-      if (intent.type === 'content' || action === 'search_file_content') {
+      if (action === 'search_file_content' || action === 'search_file_content_results') {
         const rawResults = Array.isArray(obj?.results)
           ? obj.results
           : Array.isArray(resultData?.results)
@@ -2036,7 +1969,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
             {projectMessage && <p role="status" style={{ margin: "10px 0 0", color: "#b8e9ca", fontSize: "13px" }}>{projectMessage}</p>}
           </section>
         )}
-<form className="command-form voice-first-form" onSubmit={handleSubmit}>
+        <form className="command-form voice-first-form" onSubmit={handleSubmit}>
           <div className="voice-stage">
             <div className={`voice-stage-orb${voiceListening ? " voice-stage-orb-active" : ""}${loading ? " voice-stage-orb-thinking" : ""}`}>
               <span className="voice-stage-core">V</span>
@@ -2114,7 +2047,7 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
               </div>
               <button type="button" className="qa-fix-button" onClick={() => setShowCloudinaryPanel(false)}>Close</button>
             </div>
-</section>
+          </section>
         )}
 
         <button
