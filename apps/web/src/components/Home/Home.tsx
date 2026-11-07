@@ -1682,7 +1682,11 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
 
       // Send a command to the existing PC command handler.
       // The backend decides which supported action to execute.
-      const data = await requestJSON(`${API}/api/agent/command`, {
+      const commandEndpoint = import.meta.env.PROD
+        ? '/api/agent/dispatch'
+        : '/api/agent/command';
+
+      const data = await requestJSON(`${API}${commandEndpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command: input, history: conversationHistory.slice(-10) }),

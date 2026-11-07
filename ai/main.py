@@ -12,6 +12,7 @@ import base64
 import re
 import re as regex_module
 from ai.cloudinary_oauth import router as cloudinary_oauth_router
+from ai.agent_relay import router as agent_relay_router
 import difflib
 import hashlib
 import secrets
@@ -31,6 +32,42 @@ app = FastAPI(
 )
 
 app.include_router(cloudinary_oauth_router)
+app.include_router(agent_relay_router)
+
+
+# Private credential shared only by this computer's local backend and agent.
+LOCAL_AGENT_SECRET_PATH = (
+    Path.home() / ".config" / "vantex" / "local_api_secret"
+)
+
+def load_or_create_local_agent_secret():
+    LOCAL_AGENT_SECRET_PATH.parent.mkdir(
+        parents=True, exist_ok=True, mode=0o700
+    )
+    os.chmod(LOCAL_AGENT_SECRET_PATH.parent, 0o700)
+
+    if not LOCAL_AGENT_SECRET_PATH.exists():
+        secret = secrets.token_urlsafe(48)
+        try:
+            fd = os.open(
+                LOCAL_AGENT_SECRET_PATH,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(fd, "w") as file:
+                file.write(secret)
+        except FileExistsError:
+            pass
+
+    os.chmod(LOCAL_AGENT_SECRET_PATH, 0o600)
+    secret = LOCAL_AGENT_SECRET_PATH.read_text().strip()
+
+    if len(secret) < 48:
+        raise RuntimeError("Local agent secret is invalid.")
+
+    return secret
+
+LOCAL_AGENT_SECRET = load_or_create_local_agent_secret()
 
 async def require_supabase_user(request: Request):
     """Verify the bearer token against Supabase Auth; never trust decoded client claims."""
@@ -95,6 +132,12 @@ from starlette.responses import JSONResponse as _VantexJSONResponse
 _VANTEX_RATE_BUCKETS = {}
 
 def _vantex_rate_policy(path):
+    if path == "/api/agent/pairing/create":
+        return "pairing-create", 5, 60
+    if path == "/api/agent/pair":
+        return "pair", 10, 60
+    if path == "/api/agent/dispatch":
+        return "agent-dispatch", 30, 60
     if path == "/api/security/verify-turnstile":
         return "turnstile", 10, 60
     if path == "/api/qa/test" or path.startswith("/api/agent/qa/"):
@@ -3288,6 +3331,25 @@ async def run_agent_command(request: AgentCommandRequest):
 
     
 
+
+
+
+@app.post("/api/agent/local-command")
+async def run_local_agent_command(
+    request: Request,
+    payload: AgentCommandRequest,
+):
+    host = request.client.host if request.client else ""
+
+    if host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="Local access only.")
+
+    supplied_secret = request.headers.get("X-VANTEX-LOCAL-SECRET", "")
+
+    if not secrets.compare_digest(supplied_secret, LOCAL_AGENT_SECRET):
+        raise HTTPException(status_code=401, detail="Local agent authentication failed.")
+
+    return await run_agent_command(payload)
 
 
 from fastapi import HTTPException
