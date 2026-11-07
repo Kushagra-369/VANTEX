@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import Query
 import base64
 import re
+from ai.cloudinary_oauth import router as cloudinary_oauth_router
 import difflib
 import hashlib
 import secrets
@@ -20,10 +21,13 @@ app = FastAPI(
     version="0.2.0",
 )
 
+app.include_router(cloudinary_oauth_router)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -2643,14 +2647,207 @@ async def run_agent_command(request: AgentCommandRequest):
             "result": await test_website(request_model),
         }
 
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "Command not supported yet. Try: system status, list files, "
-            "find file Home.tsx, read file apps/web/src/App.tsx, "
-            "or test website http://localhost:5173"
-        ),
-    )
+    
+    # Ollama fallback: interpret natural English, Hindi and Hinglish.
+    import asyncio
+    import json
+    import urllib.request
+    import urllib.error
+
+    payload = {
+        "model": "qwen2.5:3b",
+        "stream": False,
+        "format": "json",
+        "keep_alive": "30s",
+        "options": {"num_predict": 120, "temperature": 0},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Classify the user's request into JSON with keys "
+                    "action, query, folder, app. "
+                    "Allowed actions: search_files, open_file, launch_app, "
+                    "system_info, chat, clarify. "
+                    "Understand Hindi, English and Hinglish. "
+                    "IMPORTANT: Use system_info ONLY when the user explicitly "
+                    "asks about their PC/system status, CPU, RAM, disk, or hardware. "
+                    "Never classify ordinary conversation, identity questions, "
+                    "greetings, or farewells as system_info. "
+                    "Use chat for general conversation and questions about VANTEX. "
+                    "Never invent paths. "
+                    "For search_files, provide a concise filename query. "
+                    "For open_file, provide the requested filename. "
+                    "For launch_app, use only a supported app name. "
+                    "Use clarify only when an actionable request is genuinely ambiguous. "
+                    "folder must be Desktop, Downloads, Documents, Pictures, "
+                    "Videos or an empty string. Return valid JSON only."
+                ),
+            },
+            {"role": "user", "content": command[:2000]},
+        ],
+    }
+
+    try:
+        encoded_payload = json.dumps(payload).encode("utf-8")
+
+        def call_ollama_intent():
+            req = urllib.request.Request(
+                "http://127.0.0.1:11434/api/chat",
+                data=encoded_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=45) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        model_response = await asyncio.to_thread(call_ollama_intent)
+        raw_intent = model_response.get("message", {}).get("content", "")
+        intent = json.loads(raw_intent)
+
+        action = intent.get("action")
+        print(
+            f"[VANTEX DEBUG] command={command!r} "
+            f"classifier_intent={intent!r}",
+            flush=True,
+        )
+        query = intent.get("query", "")
+        folder = intent.get("folder", "")
+        app = intent.get("app", "")
+
+        if not all(isinstance(value, str) for value in (query, folder, app)):
+            raise ValueError("Invalid intent parameters")
+
+        if action == "search_files":
+            if not query.strip():
+                return {
+                    "command": command,
+                    "action": "clarify",
+                    "message": "Which file should I search for?",
+                }
+
+            allowed_folders = {
+                "Desktop", "Downloads", "Documents", "Pictures", "Videos"
+            }
+            selected_folder = folder if folder in allowed_folders else None
+
+            result = search_pc_files(
+                query.strip(),
+                folder=selected_folder,
+            )
+            return {
+                "command": command,
+                "action": "search_pc_files",
+                "result": result,
+            }
+
+        if action == "open_file":
+            if not query.strip():
+                return {
+                    "command": command,
+                    "action": "clarify",
+                    "message": "Which file should I open?",
+                }
+
+            result = search_pc_files(query.strip())
+            matches = result.get("matches", [])
+
+            exact_matches = [
+                item for item in matches
+                if item.get("name", "").casefold() == query.strip().casefold()
+            ]
+
+            if len(exact_matches) == 1:
+                selected = exact_matches[0]
+            elif len(matches) == 1:
+                selected = matches[0]
+            else:
+                return {
+                    "command": command,
+                    "action": "select_file",
+                    "selection_required": True,
+                    "message": (
+                        "No matching file found."
+                        if not matches
+                        else "Multiple files matched. Select the correct file."
+                    ),
+                    "result": result,
+                }
+
+            opened = open_pc_file(
+                OpenPcFileRequest(path=selected["path"])
+            )
+            return {
+                "command": command,
+                "action": "open_pc_file",
+                "result": opened,
+            }
+
+        if action == "launch_app":
+            allowed_apps = {
+                "vscode", "vs code", "visual studio code",
+                "terminal", "browser", "firefox", "chrome",
+                "file manager", "files", "text editor", "mousepad",
+                "libreoffice", "vlc",
+            }
+            app_name = app.strip().casefold()
+
+            if app_name not in allowed_apps:
+                return {
+                    "command": command,
+                    "action": "clarify",
+                    "message": "Which supported application should I launch?",
+                }
+
+            return {
+                "command": command,
+                "action": "launch_pc_app",
+                "result": _launch_pc_app(app_name),
+            }
+
+        if action == "system_info":
+            return {
+                "command": command,
+                "action": "system_status",
+                "result": get_system_status(),
+            }
+
+        if action == "chat":
+            reply = await local_agent_chat(
+                LocalChatRequest(message=command, history=[])
+            )
+            return {
+                "command": command,
+                "action": "chat",
+                "message": reply.get("reply", ""),
+                "result": reply,
+            }
+
+        # If intent classification is uncertain, treat the input as
+        # natural conversation instead of failing with a generic message.
+        reply = await local_agent_chat(
+            LocalChatRequest(message=command, history=[])
+        )
+        return {
+            "command": command,
+            "action": "chat",
+            "message": reply.get("reply", ""),
+            "result": reply,
+        }
+
+    except HTTPException:
+        raise
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama is unavailable. Start Ollama and try again.",
+        ) from exc
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned an invalid intent. Please try again.",
+        ) from exc
+
+
 
 
 from fastapi import HTTPException
@@ -3260,17 +3457,53 @@ def search_pc_files(
     matches = []
 
         # Recognize natural-language file-type searches.
+   
     extension_aliases = {
         "python": {".py"},
-        "javascript": {".js", ".jsx"},
-        "typescript": {".ts", ".tsx"},
+        "javascript": {".js", ".jsx", ".mjs", ".cjs"},
+        "typescript": {".ts", ".tsx", ".mts", ".cts"},
         "css": {".css"},
         "html": {".html", ".htm"},
         "json": {".json"},
         "pdf": {".pdf"},
-        "markdown": {".md"},
+        "markdown": {".md", ".markdown"},
         "text": {".txt"},
+        "docs": {
+            ".pdf", ".doc", ".docx", ".odt", ".rtf",
+            ".txt", ".md", ".markdown", ".rst",
+        },
+        "document": {
+            ".pdf", ".doc", ".docx", ".odt", ".rtf",
+            ".txt", ".md", ".markdown", ".rst",
+        },
+        "documents": {
+            ".pdf", ".doc", ".docx", ".odt", ".rtf",
+            ".txt", ".md", ".markdown", ".rst",
+        },
+        "image": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"},
+        "images": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"},
+        "png": {".png"},
+        "jpg": {".jpg", ".jpeg"},
+        "jpeg": {".jpeg", ".jpg"},
+        "webp": {".webp"},
+        "gif": {".gif"},
+        "bmp": {".bmp"},
+        "svg": {".svg"},
     }
+
+    requested_extensions = None
+
+    type_match = re.fullmatch(
+        r"(?:all\s+)?\.?"
+        r"(python|javascript|typescript|css|html|json|pdf|markdown|text|"
+        r"docs|documents|document|images|image|png|jpg|jpeg|webp|gif|bmp|svg)"
+        r"(?:\s+(?:source\s+)?files?)?",
+        needle,
+    )
+
+    if type_match:
+        requested_extensions = extension_aliases[type_match.group(1)]
+
 
     requested_extensions = None
     type_match = re.fullmatch(

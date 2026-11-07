@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { supabase } from '../../lib/supabase';
 import CloudinaryUploader from '../CloudinaryUploader/CloudinaryUploader';
 import './Home.css';
 
@@ -257,7 +258,20 @@ async function requestJSON(
   url: string,
   options?: RequestInit,
 ): Promise<unknown> {
-  const response = await fetch(url, options);
+  const headers = new Headers(options?.headers);
+  const apiOrigin = new URL(API, window.location.origin).origin;
+  const requestUrl = new URL(url, window.location.origin);
+
+  // Send the login token only to VANTEX's configured API.
+  if (requestUrl.origin === apiOrigin) {
+    const { data: { session } } = await supabase.auth.getSession();
+
+    if (session?.access_token) {
+      headers.set('Authorization', `Bearer ${session.access_token}`);
+    }
+  }
+
+  const response = await fetch(url, { ...options, headers });
   const text = await response.text();
 
   let body: unknown;
@@ -1698,6 +1712,50 @@ export default function Home({ onOpenIntelligence }: HomeProps) {
           ].slice(-20),
         );
       }
+
+
+      // VANTEX_FIX_PC_FILE_SEARCH_RESULTS
+      // Render filename-search results returned by the backend.
+      if (intent.type === 'files' || action === 'search_pc_files') {
+        const rawResults = Array.isArray(resultData?.matches)
+          ? resultData.matches
+          : Array.isArray(obj?.matches)
+            ? obj.matches
+            : Array.isArray(resultData?.results)
+              ? resultData.results
+              : Array.isArray(obj?.results)
+                ? obj.results
+                : [];
+
+        const files: FileItem[] = rawResults
+          .filter(
+            (item): item is Record<string, unknown> =>
+              item !== null && typeof item === 'object',
+          )
+          .map((item) => ({
+            name: String(item.name ?? ''),
+            path: String(item.path ?? ''),
+            type: typeof item.type === 'string' ? item.type : undefined,
+          }))
+          .filter((file) => file.name && file.path);
+
+        setResult({
+          title: 'File search results',
+          message:
+            files.length > 0
+              ? `Found ${files.length} matching file(s). Select a file to open it.`
+              : backendMessage ||
+              getResultMessage(
+                data,
+                'No matching files found. Try a different filename.',
+              ),
+          files,
+          data,
+        });
+
+        return;
+      }
+
 
       // Content search results.
       // Handle content searches identified by either frontend intent or backend action.

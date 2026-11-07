@@ -3,6 +3,10 @@ import Home from './components/Home/Home';
 import CloudinaryGallery from './components/CloudinaryGallery';
 import './App.css';
 
+import { type Session } from '@supabase/supabase-js';
+import Login from './components/Auth/Login';
+import { supabase } from './lib/supabase';
+
 type HealthStatus = 'up' | 'down' | 'running' | 'checking' | 'unknown';
 
 type SystemMetrics = {
@@ -31,7 +35,7 @@ type PCIntelligenceProps = {
 const API = import.meta.env.PROD
   ? 'https://vantex-2d4l.onrender.com'
   : 'http://127.0.0.1:8000';
-  
+
 async function fetchJSON<T,>(url: string): Promise<T> {
   const response = await fetch(url);
   const body: unknown = await response.json().catch(() => ({}));
@@ -327,8 +331,8 @@ function PCIntelligence({ onBack }: PCIntelligenceProps) {
   const engineRecord = asRecord(engine);
   const engineStatus = getStatus(
     engineRecord.status ??
-      engineRecord.running ??
-      engineRecord.connected,
+    engineRecord.running ??
+    engineRecord.connected,
   );
 
   const networkRecord = asRecord(network);
@@ -431,13 +435,13 @@ function PCIntelligence({ onBack }: PCIntelligenceProps) {
                       ? 'Unavailable'
                       : 'Not reported'
                   : String(
-                      engineRecord.status ??
-                        (engineRecord.running === true
-                          ? 'Running'
-                          : engineRecord.connected === true
-                            ? 'Connected'
-                            : 'Status unknown'),
-                    )}
+                    engineRecord.status ??
+                    (engineRecord.running === true
+                      ? 'Running'
+                      : engineRecord.connected === true
+                        ? 'Connected'
+                        : 'Status unknown'),
+                  )}
               </strong>
             </div>
 
@@ -606,40 +610,207 @@ function PCIntelligence({ onBack }: PCIntelligenceProps) {
 }
 
 export default function App() {
-  const [page, setPage] = useState<'home' | 'intelligence' | 'cloudinary'>(() => {
+  const [page, setPage] = useState<
+    'home' | 'intelligence' | 'cloudinary'
+  >(() => {
     const params = new URLSearchParams(window.location.search);
     return params.has('cloudinary_oauth') ? 'cloudinary' : 'home';
   });
 
-  return (
-    <main className="vantex-app">
-      {page === 'home' ? (
-        <>
-          <Home onOpenIntelligence={() => setPage('intelligence')} />
-       
-        </>
-      ) : page === 'intelligence' ? (
-        <PCIntelligence onBack={() => setPage('home')} />
-      ) : (
-        <section style={{ padding: '24px', minHeight: '80vh', background: '#050a07' }}>
-          <button
-            type="button"
-            onClick={() => setPage('home')}
+  const [isGuest, setIsGuest] = useState(false);
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [signingOut, setSigningOut] = useState(false);
+  const [authError, setAuthError] = useState('');
+
+  useEffect(() => {
+    let mounted = true;
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      if (mounted) {
+        setSession(nextSession);
+        setAuthLoading(false);
+        setAuthError('');
+      }
+    });
+
+    supabase.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!mounted) return;
+
+        if (error) {
+          setAuthError('Could not restore your session. Please reload.');
+        }
+
+        setSession(data.session);
+        setAuthLoading(false);
+      })
+      .catch(() => {
+        if (!mounted) return;
+
+        setAuthError('Could not connect to authentication. Check your connection.');
+        setAuthLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  async function handleSignOut() {
+    setSigningOut(true);
+    setAuthError('');
+
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      setAuthError(error.message);
+      setSigningOut(false);
+      return;
+    }
+
+    setPage('home');
+    setSigningOut(false);
+  }
+
+  if (authLoading) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'grid',
+          placeItems: 'center',
+          background: '#030705',
+          color: '#8bffb0',
+          fontFamily: 'inherit',
+        }}
+      >
+        Connecting to VANTEX...
+      </div>
+    );
+  }
+
+  if (!session && !isGuest) {
+    return (
+      <>
+        <Login onContinueAsGuest={() => setIsGuest(true)} />
+
+        {authError && (
+          <p
+            role="alert"
             style={{
-              marginBottom: 16,
-              padding: '10px 14px',
-              borderRadius: 9,
-              border: '1px solid rgba(91,255,160,.28)',
-              background: '#123a24',
-              color: '#aaffc4',
-              cursor: 'pointer',
+              position: 'fixed',
+              bottom: 12,
+              left: 12,
+              right: 12,
+              color: '#ff9292',
+              textAlign: 'center',
             }}
           >
-            ← Back to VANTEX
-          </button>
-          <CloudinaryGallery />
-        </section>
+            {authError}
+          </p>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div
+        style={{
+          position: 'fixed',
+          top: 12,
+          right: 16,
+          zIndex: 1000,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          padding: '8px 12px',
+          border: '1px solid rgba(91,255,160,.25)',
+          borderRadius: 10,
+          background: '#08110c',
+          color: '#d9ffe5',
+          fontSize: 12,
+        }}
+      >
+        <span>
+          {isGuest
+            ? 'Guest Mode · Limited Access'
+            : session?.user.user_metadata?.full_name ||
+            session?.user.email ||
+            'Signed in'}
+        </span>
+
+        <button
+          type="button"
+          onClick={handleSignOut}
+          disabled={signingOut}
+          style={{
+            padding: '6px 9px',
+            border: '1px solid rgba(139,255,176,.3)',
+            borderRadius: 7,
+            background: '#123a24',
+            color: '#aaffc4',
+            cursor: signingOut ? 'wait' : 'pointer',
+          }}
+        >
+          {signingOut ? 'Signing out...' : 'Logout'}
+        </button>
+      </div>
+
+      {authError && (
+        <p
+          role="alert"
+          style={{
+            position: 'fixed',
+            top: 55,
+            right: 16,
+            zIndex: 1001,
+            color: '#ff9292',
+            fontSize: 12,
+          }}
+        >
+          {authError}
+        </p>
       )}
-    </main>
+
+      <main className="vantex-app">
+        {page === 'home' ? (
+          <Home onOpenIntelligence={() => setPage('intelligence')} />
+        ) : page === 'intelligence' ? (
+          <PCIntelligence onBack={() => setPage('home')} />
+        ) : (
+          <section
+            style={{
+              padding: '24px',
+              minHeight: '80vh',
+              background: '#050a07',
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setPage('home')}
+              style={{
+                marginBottom: 16,
+                padding: '10px 14px',
+                borderRadius: 9,
+                border: '1px solid rgba(91,255,160,.28)',
+                background: '#123a24',
+                color: '#aaffc4',
+                cursor: 'pointer',
+              }}
+            >
+              ← Back to VANTEX
+            </button>
+
+            <CloudinaryGallery />
+          </section>
+        )}
+      </main>
+    </>
   );
 }

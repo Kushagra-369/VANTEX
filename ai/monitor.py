@@ -33,17 +33,10 @@ recovery_counts = {}
 
 
 def notify(title: str, message: str) -> None:
-    logging.warning("%s: %s", title, message)
+    # Desktop emergency notifications are intentionally disabled.
+    # Keep monitoring events in the application logs only.
+    logging.info("Alert recorded (desktop notification disabled): %s: %s", title, message)
 
-    if shutil.which("notify-send"):
-        try:
-            subprocess.run(
-                ["notify-send", "--urgency=critical", title, message],
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            logging.exception("Desktop notification failed")
 
 
 def load_config() -> dict:
