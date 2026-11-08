@@ -178,6 +178,68 @@ async def agent_connection(request: Request):
     }
 
 
+
+# Only these local API routes may be reached through the device relay.
+def allowed_local_operation(path: str, method: str) -> bool:
+    if method not in {"GET", "POST"}:
+        return False
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        return False
+    if ".." in path.split("/") or "\\" in path or "\x00" in path:
+        return False
+
+    allowed_prefixes = (
+        "/api/agent/pc-files/",
+        "/api/agent/files/",
+        "/api/agent/pc-control/",
+        "/api/projects/",
+    )
+    return (
+        path.startswith(allowed_prefixes)
+        or path == "/api/agent/monitor/status"
+    )
+
+
+class RelayOperation(BaseModel):
+    path: str = Field(min_length=2, max_length=300)
+    method: str = Field(default="GET", max_length=8)
+    query: dict[str, str] = Field(default_factory=dict)
+    body: dict | list | None = None
+
+
+@router.post("/operation")
+async def dispatch_operation(request: Request, body: RelayOperation):
+    user_id = await authenticated_user(request)
+    method = body.method.upper()
+
+    if not allowed_local_operation(body.path, method):
+        raise HTTPException(status_code=403, detail="This local operation is not allowed.")
+
+    if len(body.query) > 30 or any(
+        len(str(k)) > 100 or len(str(v)) > 2000
+        for k, v in body.query.items()
+    ):
+        raise HTTPException(status_code=422, detail="Invalid operation query.")
+
+    authorization = request.headers.get("Authorization", "")
+    token = authorization.partition(" ")[2].strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+
+    return await dispatch(
+        user_id,
+        "execute_operation",
+        {
+            "path": body.path,
+            "method": method,
+            "query": body.query,
+            "body": body.body,
+            "user_token": token,
+        },
+    )
+
+
 @router.post("/dispatch")
 async def dispatch_command(request: Request, body: RelayCommand):
     user_id = await authenticated_user(request)

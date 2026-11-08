@@ -67,6 +67,59 @@ async def execute_command(payload):
         return response.json()
 
 
+ALLOWED_OPERATION_PREFIXES = (
+    "/api/agent/pc-files/",
+    "/api/agent/files/",
+    "/api/agent/pc-control/",
+    "/api/projects/",
+)
+
+
+async def execute_operation(payload):
+    path = payload.get("path")
+    method = payload.get("method", "GET")
+    query = payload.get("query", {})
+    body = payload.get("body")
+    user_token = payload.get("user_token")
+
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("Invalid local operation path.")
+    if path.startswith("//") or ".." in path.split("/") or "\\" in path:
+        raise ValueError("Invalid local operation path.")
+    if not (
+        path.startswith(ALLOWED_OPERATION_PREFIXES)
+        or path == "/api/agent/monitor/status"
+    ):
+        raise ValueError("Local operation is not allowed.")
+    if method not in {"GET", "POST"}:
+        raise ValueError("Unsupported local operation method.")
+    if not isinstance(query, dict) or len(query) > 30:
+        raise ValueError("Invalid local operation query.")
+    if not isinstance(user_token, str) or not user_token:
+        raise ValueError("Missing authenticated user session.")
+
+    headers = {
+        "X-VANTEX-LOCAL-SECRET": LOCAL_SECRET,
+        "Authorization": f"Bearer {user_token}",
+    }
+
+    async with httpx.AsyncClient(timeout=110, follow_redirects=False) as client:
+        response = await client.request(
+            method,
+            f"{LOCAL_API}{path}",
+            params=query,
+            json=body if method == "POST" else None,
+            headers=headers,
+        )
+        response.raise_for_status()
+
+        try:
+            return response.json()
+        except ValueError:
+            return {"result": response.text[:20000]}
+
+
+
 async def run():
     if not RELAY_URL.startswith("wss://"):
         raise RuntimeError("VANTEX_RELAY_WS must use secure wss://.")
@@ -104,12 +157,15 @@ async def run():
                         if not isinstance(request_id, str):
                             continue
 
-                        if message.get("action") != "execute_command":
-                            raise ValueError("Unsupported action.")
+                        action = message.get("action")
+                        payload = message.get("payload", {})
 
-                        data = await execute_command(
-                            message.get("payload", {})
-                        )
+                        if action == "execute_command":
+                            data = await execute_command(payload)
+                        elif action == "execute_operation":
+                            data = await execute_operation(payload)
+                        else:
+                            raise ValueError("Unsupported action.")
 
                         result = {
                             "type": "result",

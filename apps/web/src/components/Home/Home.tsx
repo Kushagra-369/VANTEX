@@ -271,7 +271,51 @@ async function requestJSON(
     }
   }
 
-  const response = await fetch(url, { ...options, headers });
+  let response: Response;
+
+  const localAgentPath =
+    requestUrl.pathname.startsWith('/api/agent/pc-files/') ||
+    requestUrl.pathname.startsWith('/api/agent/files/') ||
+    requestUrl.pathname.startsWith('/api/agent/pc-control/') ||
+    requestUrl.pathname.startsWith('/api/projects/') ||
+    requestUrl.pathname === '/api/agent/monitor/status';
+
+  if (import.meta.env.PROD && requestUrl.origin === apiOrigin && localAgentPath) {
+    const method = (options?.method ?? 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'POST') {
+      throw new Error('Unsupported local-agent operation.');
+    }
+
+    let operationBody: unknown = undefined;
+    if (typeof options?.body === 'string' && options.body.length) {
+      try {
+        operationBody = JSON.parse(options.body);
+      } catch {
+        throw new Error('Local-agent requests must contain valid JSON.');
+      }
+    } else if (options?.body != null) {
+      throw new Error('Unsupported local-agent request body.');
+    }
+
+    const relayHeaders = new Headers({
+      'Content-Type': 'application/json',
+    });
+    const authorization = headers.get('Authorization');
+    if (authorization) relayHeaders.set('Authorization', authorization);
+
+    response = await fetch(`${API}/api/agent/operation`, {
+      method: 'POST',
+      headers: relayHeaders,
+      body: JSON.stringify({
+        path: requestUrl.pathname,
+        method,
+        query: Object.fromEntries(requestUrl.searchParams.entries()),
+        body: operationBody ?? null,
+      }),
+    });
+  } else {
+    response = await fetch(url, { ...options, headers });
+  }
   const text = await response.text();
 
   let body: unknown;
